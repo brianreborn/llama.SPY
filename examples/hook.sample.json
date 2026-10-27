@@ -1,0 +1,25 @@
+{
+  "llamaspy_hook": 1,
+  "name": "slot-watch",
+  "note": "example HookScript -- fake offsets + js_body demo tools (echo, add)",
+  "readonly": true,
+  "tools": [
+    {
+      "name": "gg_read_n_past",
+      "description": "Read n_past via declared binding",
+      "json_schema": "{\"type\":\"object\",\"properties\":{}}",
+      "handler": "read_binding:n_past"
+    },
+    {
+      "name": "gg_predicted_tok_s",
+      "description": "Read predicted tokens/sec binding",
+      "json_schema": "{}",
+      "handler": "read_binding:predicted_tok_s"
+    }
+  ],
+  "bindings": [
+    "LLMS1|sym=n_past|off=0xdead0000|width=8|type=u64|fp=llama.cpp@fake|note=kv cursor",
+    "LLMS1|sym=predicted_tok_s|off=0xdead0100|type=f64|fp=llama.cpp@fake|note=gen rate"
+  ],
+  "js_body": "log(\"slot-watch js_body starting\");\n\nregisterTool({\n  name: \"echo\",\n  description: \"Echo JSON args back (JS demo)\",\n  schema: { type: \"object\", properties: { msg: { type: \"string\" } } },\n  handler: function (args) {\n    return { ok: true, echo: args };\n  }\n});\n\nregisterTool({\n  name: \"add\",\n  description: \"Add args.a + args.b (JS demo)\",\n  schema: {\n    type: \"object\",\n    properties: { a: { type: \"number\" }, b: { type: \"number\" } }\n  },\n  handler: function (args) {\n    var a = Number(args && args.a != null ? args.a : 0);\n    var b = Number(args && args.b != null ? args.b : 0);\n    return { sum: a + b };\n  }\n});\n\n// Demonstrate readBinding metadata stub (no mem read yet)\nvar meta = readBinding(\"n_past\");\nlog(\"readBinding(n_past) =>\", meta);\n"
+}

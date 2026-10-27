@@ -1,0 +1,74 @@
+name: FreeBSD prebuilt
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to attach asset to (e.g. v0.1.0-test1)'
+        required: false
+        default: 'v0.1.0-test1'
+
+permissions:
+  contents: write
+
+jobs:
+  freebsd-amd64:
+    runs-on: ubuntu-latest
+    name: Build FreeBSD amd64 prebuilt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.1"
+          usesh: true
+          prepare: |
+            pkg install -y cmake llvm git
+          run: |
+            set -e
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build -j"$(sysctl -n hw.ncpu)"
+            strip -o build/llamaspy.stripped build/llamaspy || cp build/llamaspy build/llamaspy.stripped
+            VER=$(tr -d ' \n' < VERSION || echo 0.1.0-test1)
+            STAGE=llamaspy-freebsd-amd64
+            rm -rf "$STAGE" dist-out
+            mkdir -p "$STAGE/bin" "$STAGE/scripts" "$STAGE/examples" "$STAGE/locales" dist-out
+            cp build/llamaspy.stripped "$STAGE/bin/llamaspy"
+            chmod +x "$STAGE/bin/llamaspy"
+            cp bin/run-hook-smoke.sh "$STAGE/bin/" 2>/dev/null || true
+            chmod +x "$STAGE/bin/run-hook-smoke.sh" 2>/dev/null || true
+            cp scripts/llama_decode.d "$STAGE/scripts/"
+            cp examples/hook.sample.json examples/codes.sample.gg "$STAGE/examples/"
+            cp locales/en.json locales/ja.json "$STAGE/locales/"
+            cp README.md README-PREBUILT.md LICENSE VERSION "$STAGE/"
+            tar -czf "dist-out/llamaspy-freebsd-amd64-${VER}.tar.gz" "$STAGE"
+            ls -la dist-out/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamaspy-freebsd-amd64
+          path: dist-out/*.tar.gz
+
+      - name: Attach to GitHub Release (if tag / input set)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          case "$GITHUB_REF" in
+            refs/tags/*) ;;
+            *) TAG="${INPUT_TAG:-v0.1.0-test1}" ;;
+          esac
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG not found yet; artifact only."
+            exit 0
+          fi
+          gh release upload "$TAG" dist-out/*.tar.gz --clobber
+          echo "Uploaded FreeBSD asset(s) to $TAG"

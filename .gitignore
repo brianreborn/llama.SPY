@@ -1,0 +1,27 @@
+# Build
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.a
+*.so
+*.dylib
+
+# Built binary at repo root or under build/ (NOT include/llamaspy/)
+/llamaspy
+/build/llamaspy
+
+# Local / HUD / smoke dumps
+LIVE.txt
+SMOKE.txt
+dist/
+dist-staging/
+.cache/
+*.user
+*.swp
+*~
+.DS_Store
+
+# Release scratch
+*.tar.gz

@@ -1,0 +1,27 @@
+llama.SPY — release status
+Version: 0.1.0-test1
+Updated: 2026-10-27 America/Los_Angeles
+
+Product: llama.SPY (binary: llamaspy)
+Focus: FreeBSD-first realtime observability for a running llama.cpp process.
+
+This tag ships a downloadable Linux amd64 prebuilt test bundle. FreeBSD amd64
+prebuilt is produced by CI (or qodesh) and attached when available.
+
+Working in this release
+- HTTP /metrics (+ optional /slots) observability HUD
+- HookScript (JSON) + LLMS1 Game Genie dialect
+- Duktape js_body: registerTool / --list-tools / --call-tool
+- DTrace script packaging + path resolution (live on FreeBSD)
+- i18n en/ja (compiled-in tables; locales/*.json shipped for reference)
+
+Known stubs (intentional for test1)
+- Mem read backend for GG bindings (readBinding returns metadata only)
+- --serve privilege-separated collector (see docs/PRIVSEP.md)
+- --from-url remote HookScript draft (no remote exec)
+- Linux DTrace provider is a NotSupported stub (use --backend http)
+
+Smoke (Linux prebuilt)
+  ./bin/run-hook-smoke.sh
+  # or:
+  ./bin/llamaspy --hook-file examples/hook.sample.json --call-tool echo '{"msg":"hi"}'

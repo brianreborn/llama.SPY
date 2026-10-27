@@ -1,0 +1,18 @@
+# llama.SPY Game Genie v1 — SAMPLE ONLY
+# Offsets below are FAKE placeholders for parser / CLI dry-runs.
+# Do not point these at a live process; replace after measuring your build.
+#
+# Format: LLMS1|sym=...|off=0x...|width=N|type=...|fp=...|note=...
+# See docs/GAME_GENIE.md
+
+LLMS1
+
+# Optional build fingerprint (also accepted per-line as fp= / build=)
+LLMS1|sym=n_past|off=0xdead0000|width=8|type=u64|fp=llama.cpp@sample-not-real|note=kv n_past cursor (FAKE)
+LLMS1|sym=n_decode|off=0xdead0040|type=u32|fp=llama.cpp@sample-not-real|note=decode counter (FAKE)
+LLMS1|sym=predicted_tok_s|off=0xdead0100|type=f64|note=generation tok/s gauge (FAKE)
+LLMS1|sym=prompt_tok_s|off=0xdead0108|width=8|type=f64|note=prompt tok/s gauge (FAKE)
+LLMS1|sym=requests_processing|off=0xdead0200|type=u32|note=busy slots (FAKE)
+
+# Unknown keys are ignored (forward-compat probe):
+LLMS1|sym=extra_probe|off=0xdead0ff0|type=u8|future_key=ignore_me|note=unknown-key test
