@@ -4,7 +4,7 @@
   "help.usage": "Usage",
   "help.primary": "Primary (FreeBSD): --backend dtrace --pid <llama_pid>",
   "help.portable": "Portable fallback: --backend http --metrics-url http://127.0.0.1:8080/metrics",
-  "help.auto": "auto: prefer dtrace on FreeBSD, else http if URL given",
+  "help.auto": "auto: --pid uses dtrace (FreeBSD) or bpftrace (Linux), else http if URL given",
   "help.hud": "Default: one-pane ANSI HUD each poll; --no-hud prints [SnoopV1] lines",
   "help.hook": "--hook-file PATH: load HookScript (JSON) or LLMS1 codes; registers tools",
   "help.gg": "--gg-file PATH: LLMS1 paste-in codes only (simple dialect)",

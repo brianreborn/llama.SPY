@@ -1,5 +1,9 @@
+test2 (2026-10-30): Linux bpftrace live-attach backend + bin/run-attach-smoke.sh.
+Prebuilts cross-compiled with zig 0.17 (Linux static musl; FreeBSD x86_64) because
+miryam/angel were offline; FreeBSD binary not yet run on angel.
+
 llama.SPY — release status
-Version: 0.1.0-test1
+Version: 0.1.0-test2
 Updated: 2026-10-27 America/Los_Angeles
 
 Product: llama.SPY (binary: llamaspy)
@@ -19,7 +23,8 @@ Known stubs (intentional for test1)
 - Mem read backend for GG bindings (readBinding returns metadata only)
 - --serve privilege-separated collector (see docs/PRIVSEP.md)
 - --from-url remote HookScript draft (no remote exec)
-- Linux DTrace provider is a NotSupported stub (use --backend http)
+- Linux live attach: bpftrace-linux provider (uprobes on llama_decode), parity with FreeBSD dtrace
+- auto --pid: dtrace on FreeBSD, bpftrace on Linux, then http/log
 
 Smoke (Linux prebuilt)
   ./bin/run-hook-smoke.sh

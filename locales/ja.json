@@ -4,7 +4,7 @@
   "help.usage": "使い方",
   "help.primary": "推奨 (FreeBSD): --backend dtrace --pid <llama_pid>",
   "help.portable": "移植フォールバック: --backend http --metrics-url http://127.0.0.1:8080/metrics",
-  "help.auto": "auto: FreeBSDではdtrace優先、それ以外はURLがあればhttp",
+  "help.auto": "auto: --pid時はdtrace(FreeBSD)/bpftrace(Linux)、それ以外はURLがあればhttp",
   "help.hud": "既定: 1ペインANSI HUD。--no-hud で [SnoopV1] 行出力",
   "help.hook": "--hook-file PATH: HookScript (JSON) または LLMS1 を読込しツール登録",
   "help.gg": "--gg-file PATH: LLMS1 オフセットコードのみ（簡易方言）",

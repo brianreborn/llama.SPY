@@ -1,6 +1,6 @@
 # llama.SPY prebuilt test bundle
 
-Version **0.1.0-test1**. Binary name: `llamaspy`. Product: **llama.SPY**.
+Version **0.1.0-test2**. Binary name: `llamaspy`. Product: **llama.SPY**.
 
 ## Layout
 
@@ -22,7 +22,7 @@ llamaspy-<os>-amd64/
 ## Unpack (Linux amd64)
 
 ```sh
-tar -xzf llamaspy-linux-amd64-0.1.0-test1.tar.gz
+tar -xzf llamaspy-linux-amd64-0.1.0-test2.tar.gz
 cd llamaspy-linux-amd64
 ```
 
@@ -64,7 +64,7 @@ Optional: `--slots-url`, `--api-key`, `--no-hud`.
 # script auto-resolves to ../scripts/llama_decode.d from bin/
 ```
 
-Linux builds compile the DTrace provider as a stub (`NotSupported`); use HTTP.
+Linux live attach: `sudo ./bin/llamaspy --backend auto --pid PID` (needs bpftrace). FreeBSD: same command uses dtrace.
 
 ## Runtime deps (Linux)
 

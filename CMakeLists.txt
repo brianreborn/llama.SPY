@@ -12,7 +12,7 @@ include(GNUInstallDirs)
 if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
   message(STATUS "FreeBSD detected: DTrace provider is PRIMARY backend for llama.SPY")
 else()
-  message(STATUS "Non-FreeBSD host: DTrace provider compiles as stub; HTTP /metrics works")
+  message(STATUS "Non-FreeBSD host: DTrace stub; Linux live attach uses bpftrace uprobes (--backend bpftrace)")
 endif()
 
 # Vendored Duktape for HookScript js_body (default ON — no network at build time).
@@ -36,6 +36,7 @@ set(LLAMASPY_SOURCES
   src/main.cpp
   src/metrics_http.cpp
   src/provider_dtrace_freebsd.cpp
+  src/provider_bpftrace_linux.cpp
   src/tui_stub.cpp
   src/game_genie.cpp
   src/log_timings.cpp
@@ -77,7 +78,7 @@ if(LLAMASPY_HAVE_DUKTAPE)
 endif()
 
 install(TARGETS llamaspy RUNTIME DESTINATION bin)
-install(FILES scripts/llama_decode.d DESTINATION share/llamaspy)
+install(FILES scripts/llama_decode.d scripts/llama_decode.bt DESTINATION share/llamaspy)
 file(GLOB LLAMASPY_LOCALES ${CMAKE_CURRENT_SOURCE_DIR}/locales/*.json)
 install(FILES ${LLAMASPY_LOCALES} DESTINATION share/llamaspy/locales)
 install(FILES docs/DESIGN.md docs/PRIOR_ART.md docs/PRIVSEP.md docs/GAME_GENIE.md docs/METRICS_MAP.md README.md DESTINATION share/doc/llamaspy)

@@ -11,7 +11,7 @@ Hermes is an example stack only.
 
 ## Prebuilt test builds
 
-Download a ready-to-run bundle from [Releases](https://github.com/brianreborn/llama.SPY/releases) (start with **v0.1.0-test1**).
+Download a ready-to-run bundle from [Releases](https://github.com/brianreborn/llama.SPY/releases) (latest **v0.1.0-test2**: Linux + FreeBSD live attach).
 
 - Linux amd64: unpack and run `./bin/run-hook-smoke.sh` — see [README-PREBUILT.md](README-PREBUILT.md)
 - FreeBSD amd64: attached when CI / qodesh produces it
@@ -39,14 +39,16 @@ First match wins:
 4. beside the executable (`<exe>/llama_decode.d`, `<exe>/scripts/`, `<exe>/../scripts/`, `<exe>/../share/llamaspy/`)
 5. compile-time install dir `${CMAKE_INSTALL_PREFIX}/share/llamaspy/llama_decode.d` (set prefix at configure: `cmake -DCMAKE_INSTALL_PREFIX=/usr/local ..`)
 
-### Linux / other (HTTP + DTrace stub)
+### Linux (HTTP + bpftrace live attach)
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-The DTrace provider **compiles as a stub** (`AttachStatus::NotSupported`). Use `--backend http`.
+Live attach uses **bpftrace uprobes** on `llama_decode` (`--backend bpftrace` or `auto --pid PID`), mirroring `scripts/llama_decode.d` via `scripts/llama_decode.bt`. The target ELF is `libllama*.so` from `/proc/PID/maps`, else `/proc/PID/exe`. Needs `bpftrace` installed and root (or CAP_BPF+CAP_PERFMON; CAP_SYS_ADMIN on older kernels). Read-only, no ptrace, target untouched. Same `ts n avg_ns` lines → SnoopV1 frames as DTrace.
+
+Shared smoke for both OSes: `bin/run-attach-smoke.sh [--pid PID] [--metrics-url URL]`.
 
 Dependencies: C++20 STL + POSIX sockets + vendored Duktape C amalgamation (no Boost, no libcurl, no system JS package).  
 Binary name: `llamaspy` (filesystem-safe); product name: **llama.SPY**.

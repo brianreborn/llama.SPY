@@ -1,0 +1,28 @@
+#!/usr/bin/env bpftrace
+/*
+ * llama.SPY — Linux eBPF/uprobe path (mirror of scripts/llama_decode.d).
+ * Template: llamaspy replaces @TARGET@ with the ELF that defines llama_decode
+ * (libllama.so from /proc/PID/maps, or /proc/PID/exe for static builds) and
+ * runs:  bpftrace -p PID <generated.bt>
+ * Manual: sed "s|@TARGET@|/path/libllama.so|" llama_decode.bt > /tmp/x.bt && sudo bpftrace -p PID /tmp/x.bt
+ * Needs root or CAP_BPF+CAP_PERFMON (+CAP_SYS_ADMIN on older kernels). Read-only: uprobes, no ptrace.
+ * Output (same as .d): "timestamp_ns decode_count avg_latency_ns" each second.
+ */
+BEGIN
+{
+  printf("# llama.SPY bpftrace: uprobe llama_decode in @TARGET@\n");
+  printf("# columns: timestamp_ns decode_count avg_latency_ns\n");
+}
+uprobe:@TARGET@:llama_decode /pid == @PID@/ { @t[tid] = nsecs; }
+uretprobe:@TARGET@:llama_decode /@t[tid]/
+{
+  $dt = nsecs - @t[tid]; delete(@t[tid]);
+  @n = @n + 1; @sum = @sum + $dt;
+  @avg_ns = avg($dt); @max_ns = max($dt); @cnt = count();
+}
+interval:s:1 /@n > 0/
+{
+  printf("%llu %llu %llu\n", nsecs, @n, @sum / @n);
+  @n = 0; @sum = 0;
+}
+END { printf("# final aggregations\n"); clear(@t); clear(@n); clear(@sum); }

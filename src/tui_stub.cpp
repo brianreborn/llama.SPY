@@ -25,7 +25,7 @@ AttachModeBadge BadgeFromBackendName(const char* provider_name,
                                      const char* cli_backend) {
   const char* s = (cli_backend && cli_backend[0]) ? cli_backend : provider_name;
   if (!s) return AttachModeBadge::Auto;
-  if (std::strstr(s, "dtrace") != nullptr) return AttachModeBadge::Dtrace;
+  if (std::strstr(s, "dtrace") != nullptr || std::strstr(s, "bpftrace") != nullptr) return AttachModeBadge::Dtrace;  // live-attach badge
   if (std::strstr(s, "http") != nullptr) return AttachModeBadge::Http;
   if (std::strstr(s, "log") != nullptr) return AttachModeBadge::Log;
   if (std::strcmp(s, "auto") == 0) return AttachModeBadge::Auto;

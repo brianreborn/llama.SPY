@@ -28,7 +28,7 @@ void Usage(const char* argv0) {
   std::cerr
       << llamaspy::T("banner") << "\n"
       << llamaspy::T("help.usage") << " " << argv0
-      << " [--pid N] [--metrics-url URL] [--backend auto|http|dtrace|log]\n"
+      << " [--pid N] [--metrics-url URL] [--backend auto|http|dtrace|bpftrace|log]\n"
       << "         [--slots-url URL] [--api-key KEY] [--log-file PATH]\n"
       << "         [--dtrace-script PATH] [--no-hud] [--hook-file PATH|-] [--gg-file PATH|-]\n         [--list-tools] [--call-tool NAME [json-args]] [--from-url URL] [--lang xx]\n"
       << "\n"
@@ -299,6 +299,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<llamaspy::TelemetryProvider> provider;
   if (backend == "dtrace") {
     provider = llamaspy::MakeDtraceFreeBsdProvider();
+  } else if (backend == "bpftrace" || backend == "uprobe") {
+    provider = llamaspy::MakeBpftraceLinuxProvider();
   } else if (backend == "http") {
     provider = llamaspy::MakeHttpMetricsProvider();
   } else if (backend == "log") {
@@ -318,13 +320,19 @@ int main(int argc, char** argv) {
       return 2;
     }
 #else
-    if (!metrics_url.empty()) {
+    if (pid != 0) {
+#  if defined(__linux__)
+      provider = llamaspy::MakeBpftraceLinuxProvider();
+#  else
+      std::cerr << "auto: no live-attach backend on this OS; use --metrics-url\n";
+      return 2;
+#  endif
+    } else if (!metrics_url.empty()) {
       provider = llamaspy::MakeHttpMetricsProvider();
     } else if (!log_file.empty()) {
       provider = llamaspy::MakeLogTimingsProvider();
     } else {
-      std::cerr << "auto on non-FreeBSD: need --metrics-url or --log-file "
-                   "(dtrace is FreeBSD primary; stub here)\n";
+      std::cerr << "auto: need --pid (bpftrace), --metrics-url, or --log-file\n";
       return 2;
     }
 #endif

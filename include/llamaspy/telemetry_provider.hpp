@@ -45,6 +45,7 @@ class TelemetryProvider {
 
 std::unique_ptr<TelemetryProvider> MakeHttpMetricsProvider();
 std::unique_ptr<TelemetryProvider> MakeDtraceFreeBsdProvider();
+std::unique_ptr<TelemetryProvider> MakeBpftraceLinuxProvider();  // Linux uprobes
 std::unique_ptr<TelemetryProvider> MakeLogTimingsProvider();
 
 } // namespace llamaspy
