@@ -2,6 +2,7 @@
 // FreeBSD DTrace pid provider). Spawns `bpftrace -p PID <generated.bt>` and
 // parses the same "ts n avg" lines into SnoopV1 frames. Read-only; no ptrace.
 // Requires root or CAP_BPF+CAP_PERFMON. Non-Linux builds get a stub.
+#include <cerrno>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <vector>
@@ -76,16 +77,17 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
       size_t off = 0;
       while (off < s.size()) {
         ssize_t n = write(fd, s.data() + off, s.size() - off);
-        if (n <= 0) { close(fd); unlink(gen_.c_str()); return AttachStatus::Failed; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); DropGen(); return AttachStatus::Failed; }
         off += size_t(n);
       }
-      close(fd);
+      if (close(fd) != 0 && errno != EINTR) { DropGen(); return AttachStatus::Failed; }
     }
     std::cerr << "[bpftrace-linux] target " << target << "\n";
     int pipefd[2];
-    if (pipe(pipefd) != 0) return AttachStatus::Failed;
+    if (pipe(pipefd) != 0) { DropGen(); return AttachStatus::Failed; }
     child_ = fork();
-    if (child_ < 0) return AttachStatus::Failed;
+    if (child_ < 0) { close(pipefd[0]); close(pipefd[1]); child_ = -1; DropGen(); return AttachStatus::Failed; }
     if (child_ == 0) {
       close(pipefd[0]); dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]);
       std::string p = std::to_string(pid_);
@@ -131,6 +133,7 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
   }
   ~BpftraceLinuxProvider() override { Detach(); }
  private:
+  void DropGen() { if (!gen_.empty()) { unlink(gen_.c_str()); gen_.clear(); } }
   uint32_t pid_ = 0; pid_t child_ = -1; FILE* fp_ = nullptr; bool attached_ = false; std::string gen_;
 };
 #else
