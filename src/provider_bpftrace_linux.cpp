@@ -2,6 +2,10 @@
 // FreeBSD DTrace pid provider). Spawns `bpftrace -p PID <generated.bt>` and
 // parses the same "ts n avg" lines into SnoopV1 frames. Read-only; no ptrace.
 // Requires root or CAP_BPF+CAP_PERFMON. Non-Linux builds get a stub.
+#include <cerrno>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <vector>
 #include "llamaspy/telemetry_provider.hpp"
 
 #include <cstdio>
@@ -59,13 +63,31 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
     if (target.empty()) { std::cerr << "[bpftrace-linux] cannot read /proc/" << pid_ << "\n"; return AttachStatus::NeedPrivileges; }
     for (auto [k, v] : {std::pair<std::string, std::string>{"@TARGET@", target}, {"@PID@", std::to_string(pid_)}})
       for (size_t i; (i = s.find(k)) != std::string::npos;) s.replace(i, k.size(), v);
-    gen_ = "/tmp/llamaspy-" + std::to_string(getpid()) + ".bt";
-    { std::ofstream o(gen_); o << s; }
+    // t835u: never a predictable /tmp name (root bpftrace runs this file). mkstemps
+    // creates O_EXCL 0600 in ${TMPDIR:-/tmp}; we write through the fd we own.
+    {
+      const char* td = std::getenv("TMPDIR");
+      std::string t = std::string(td && *td ? td : "/tmp") + "/llamaspy-XXXXXX.bt";
+      std::vector<char> buf(t.begin(), t.end()); buf.push_back('\0');
+      mode_t old = umask(077);
+      int fd = mkstemps(buf.data(), 3);
+      umask(old);
+      if (fd < 0) { std::cerr << "[bpftrace-linux] mkstemps failed\n"; return AttachStatus::Failed; }
+      gen_ = buf.data();
+      size_t off = 0;
+      while (off < s.size()) {
+        ssize_t n = write(fd, s.data() + off, s.size() - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); DropGen(); return AttachStatus::Failed; }
+        off += size_t(n);
+      }
+      if (close(fd) != 0 && errno != EINTR) { DropGen(); return AttachStatus::Failed; }
+    }
     std::cerr << "[bpftrace-linux] target " << target << "\n";
     int pipefd[2];
-    if (pipe(pipefd) != 0) return AttachStatus::Failed;
+    if (pipe(pipefd) != 0) { DropGen(); return AttachStatus::Failed; }
     child_ = fork();
-    if (child_ < 0) return AttachStatus::Failed;
+    if (child_ < 0) { close(pipefd[0]); close(pipefd[1]); child_ = -1; DropGen(); return AttachStatus::Failed; }
     if (child_ == 0) {
       close(pipefd[0]); dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]);
       std::string p = std::to_string(pid_);
@@ -111,6 +133,7 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
   }
   ~BpftraceLinuxProvider() override { Detach(); }
  private:
+  void DropGen() { if (!gen_.empty()) { unlink(gen_.c_str()); gen_.clear(); } }
   uint32_t pid_ = 0; pid_t child_ = -1; FILE* fp_ = nullptr; bool attached_ = false; std::string gen_;
 };
 #else
