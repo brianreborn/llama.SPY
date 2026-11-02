@@ -131,6 +131,137 @@ CLI help + HUD labels via `T("key")`. Auto-pick: `LLAMASPY_LANG` → `LANG` /
 `locales/ja.json`. **Add a language:** copy `locales/en.json` → `locales/xx.json`
 (and extend the built-in table until a JSON loader lands). No gettext toolchain.
 
+## Diagrams
+
+Mermaid diagrams of `main` (`a0f4916`, v0.1.0-test2), rendered by GitHub. The text privsep diagram in [docs/PRIVSEP.md](docs/PRIVSEP.md) and the SnoopV1 / ring tables in [docs/DESIGN.md](docs/DESIGN.md) stay as they are. Dashed parts are designed, not implemented.
+
+### Components and data path
+
+```mermaid
+flowchart LR
+  target["running llama-server<br/>(not modified, no ptrace)"]
+  subgraph backends["TelemetryProvider backends"]
+    dtrace["dtrace-freebsd<br/>scripts/llama_decode.d<br/>pid provider on llama_decode"]
+    bpf["bpftrace-linux<br/>scripts/llama_decode.bt<br/>uprobe on llama_decode"]
+    http["http-metrics<br/>GET /metrics (Prometheus text)"]
+  end
+  frame["SnoopV1 frame<br/>64 bytes, magic LLMS"]
+  hud["HUD / summary output<br/>i18n en, ja"]
+  gg["Game Genie<br/>HookScripts -> ToolRegistry<br/>Duktape js_body"]
+  serve["--serve (dropped privileges)<br/>HTTP / TUI"]
+
+  target -->|FreeBSD, --pid| dtrace
+  target -->|Linux, --pid| bpf
+  target -->|--metrics-url| http
+  dtrace --> frame
+  bpf --> frame
+  http --> frame
+  frame --> hud
+  gg -->|--list-tools, --call-tool| hud
+  frame -.->|"socketpair, later SHM ring"| serve
+```
+
+`auto` picks DTrace on FreeBSD and bpftrace on Linux when `--pid` is given; otherwise it needs `--metrics-url`.
+
+### Provider lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Select: --backend dtrace | bpftrace | http | auto
+  Select --> Attach: pid or metrics URL
+  Select --> Error: auto without --pid or --metrics-url
+  Attach --> Streaming: tracer spawned / first scrape ok
+  Attach --> Error: no privileges (dtrace, CAP_BPF + CAP_PERFMON) or target gone
+  Streaming --> Streaming: ts n avg_ns lines -> SnoopV1 frames
+  Streaming --> Detach: Ctrl-C, target exit
+  Detach --> [*]
+  Error --> [*]
+```
+
+### IPC: SPSC ring (designed, not implemented)
+
+```mermaid
+sequenceDiagram
+  participant C as Collector (producer)
+  participant H as SharedRingHeader (head, tail, meta on own 64-byte lines)
+  participant S as Serve or TUI (consumer)
+  C->>H: load tail (acquire)
+  alt head - tail == capacity
+    C->>C: full (drop policy to be decided)
+  else space
+    C->>H: write frame into slot head % capacity (host byte order)
+    C->>H: store head + 1 (release)
+  end
+  S->>H: load head (acquire)
+  alt tail == head
+    S->>S: empty, poll
+  else frame ready
+    S->>H: read slot tail % capacity
+    S->>H: store tail + 1 (release)
+  end
+  Note over C,S: generation bump on collector restart poisons stale consumers.<br/>MVP --serve uses socketpair, hton / ntoh only at that boundary.
+```
+
+### Privilege separation (designed for `--serve`)
+
+```mermaid
+flowchart TB
+  parent["parent: socketpair(AF_UNIX, SOCK_SEQPACKET)<br/>then reaper"]
+  coll["collector child<br/>DTrace / bpftrace / metrics<br/>never binds a port"]
+  srv["serve child<br/>listen, accept, render<br/>never opens /dev/dtrace*"]
+  parent -->|fork| coll
+  parent -->|fork| srv
+  coll -.->|"SnoopV1 frames over the FD<br/>(Capsicum: CAP_SEND)"| srv
+```
+
+### Data model
+
+```mermaid
+erDiagram
+  SNOOP_V1_FRAME {
+    u32 magic
+    u16 version
+    u16 flags
+    u64 timestamp_ns
+    u32 pid
+    u32 decode_count
+    f64 predicted_tok_s
+    f64 prompt_tok_s
+    u32 requests_processing
+    u32 requests_deferred
+    u64 decode_latency_ns_sum
+    u32 decode_latency_n
+  }
+  HOOK_SCRIPT ||--o{ TOOL : "registers"
+  TOOL_REGISTRY ||--o{ TOOL : "holds (in memory)"
+  HOOK_SCRIPT {
+    int llamaspy_hook
+    string name
+    bool readonly
+    list tools
+    list bindings
+    string js_body
+  }
+  TOOL {
+    string name
+    string description
+    json json_schema
+    string handler
+  }
+```
+
+### Where it runs
+
+```mermaid
+flowchart LR
+  angel["angel (FreeBSD)<br/>primary: DTrace attach"]
+  linux["Linux hosts (box, miryam, macmini)<br/>bpftrace attach or /metrics"]
+  other["Windows, Termux, macOS<br/>/metrics only for now"]
+  angel --- spy(("llama.SPY"))
+  linux --- spy
+  other -.- spy
+```
+
 ## Layout
 
 ```
