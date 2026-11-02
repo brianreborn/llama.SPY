@@ -254,10 +254,10 @@ erDiagram
 
 ```mermaid
 flowchart LR
-  angel["angel (FreeBSD)<br/>primary: DTrace attach"]
-  linux["Linux hosts (box, miryam, macmini)<br/>bpftrace attach or /metrics"]
+  fbsd["FreeBSD node<br/>primary: DTrace attach"]
+  linux["Linux nodes (GPU node, CI node, test node)<br/>bpftrace attach or /metrics"]
   other["Windows, Termux, macOS<br/>/metrics only for now"]
-  angel --- spy(("llama.SPY"))
+  fbsd --- spy(("llama.SPY"))
   linux --- spy
   other -.- spy
 ```
