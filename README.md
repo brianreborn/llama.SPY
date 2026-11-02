@@ -176,12 +176,19 @@ stateDiagram-v2
   [*] --> Select: --backend dtrace | bpftrace (uprobe) | http | log | auto
   Select --> Attach: pid, metrics URL or log file
   Select --> Error: auto without --pid, --metrics-url or --log-file, or auto --pid off FreeBSD / Linux (exit 2)
-  Attach --> Streaming: tracer forked / URL set / log file set
-  Attach --> Error: /proc unreadable, script missing, fork / pipe failed, wrong-OS stub NotSupported (exit 1)
+  Attach --> Streaming: tracer forked / URL set / log file opened
+  Attach --> Error: /proc unreadable, script missing, log file unreadable, fork / pipe failed, wrong-OS stub NotSupported (exit 1)
   Streaming --> Streaming: ts n avg_ns lines -> SnoopV1 frames
-  Streaming --> Streaming: http GET failed, retry after 1 s
+  Streaming --> Streaming: http GET or log read failed, retry after 1 s
   Streaming --> Detach: tracer exited (no privileges, CAP_BPF + CAP_PERFMON, or target gone), exit 0
-  Streaming --> Detach: Ctrl-C / SIGTERM, or target exit (dtrace / bpftrace only)
+  Streaming --> Detach: Ctrl-C (terminal SIGINT also stops the tracer), or target exit (dtrace / bpftrace)
+  Streaming --> Detach: SIGTERM (http / log within 1 s)
+  note right of Streaming
+    SIGTERM only clears a flag. With dtrace / bpftrace the loop
+    waits on the tracer, which prints only while the target
+    decodes, so SIGTERM to llama.SPY alone is seen after the
+    next tracer line. An idle target can block it indefinitely.
+  end note
   Detach --> [*]: SIGINT (bpftrace) or SIGTERM (dtrace), waitpid
   Error --> [*]
 ```
