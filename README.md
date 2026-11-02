@@ -144,37 +144,45 @@ flowchart LR
     dtrace["dtrace-freebsd<br/>scripts/llama_decode.d<br/>pid provider on llama_decode"]
     bpf["bpftrace-linux<br/>scripts/llama_decode.bt<br/>uprobe on llama_decode"]
     http["http-metrics<br/>GET /metrics (Prometheus text)"]
+    logp["log-timings<br/>--backend log --log-file"]
   end
   frame["SnoopV1 frame<br/>64 bytes, magic LLMS"]
   hud["HUD / summary output<br/>i18n en, ja"]
   gg["Game Genie<br/>HookScripts -> ToolRegistry<br/>Duktape js_body"]
-  serve["--serve (dropped privileges)<br/>HTTP / TUI"]
+  stdout["stdout"]
+  serve["--serve (stub, exits 2;<br/>designed: dropped privileges, HTTP / TUI)"]
 
   target -->|FreeBSD, --pid| dtrace
   target -->|Linux, --pid| bpf
   target -->|--metrics-url| http
+  target -->|--log-file| logp
+  logp --> frame
   dtrace --> frame
   bpf --> frame
   http --> frame
   frame --> hud
-  gg -->|--list-tools, --call-tool| hud
-  frame -.->|"socketpair, later SHM ring"| serve
+  gg -->|--list-tools, --call-tool| stdout
+  frame -.->|"designed: socketpair, later SHM ring"| serve
+  classDef planned stroke-dasharray: 4 3
+  class serve planned
 ```
 
-`auto` picks DTrace on FreeBSD and bpftrace on Linux when `--pid` is given; otherwise it needs `--metrics-url`.
+`auto` picks DTrace on FreeBSD and bpftrace on Linux when `--pid` is given; otherwise it needs `--metrics-url` or `--log-file`. On other systems `auto --pid` errors (no live-attach backend). `uprobe` is an alias for `bpftrace`. `--serve` is drawn dashed because it is a stub that exits 2.
 
 ### Provider lifecycle
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Select: --backend dtrace | bpftrace | http | auto
-  Select --> Attach: pid or metrics URL
-  Select --> Error: auto without --pid or --metrics-url
-  Attach --> Streaming: tracer spawned / first scrape ok
-  Attach --> Error: no privileges (dtrace, CAP_BPF + CAP_PERFMON) or target gone
+  [*] --> Select: --backend dtrace | bpftrace (uprobe) | http | log | auto
+  Select --> Attach: pid, metrics URL or log file
+  Select --> Error: auto without --pid, --metrics-url or --log-file, or auto --pid off FreeBSD / Linux (exit 2)
+  Attach --> Streaming: tracer forked / URL set / log file set
+  Attach --> Error: /proc unreadable, script missing, fork / pipe failed, wrong-OS stub NotSupported (exit 1)
   Streaming --> Streaming: ts n avg_ns lines -> SnoopV1 frames
-  Streaming --> Detach: Ctrl-C, target exit
-  Detach --> [*]
+  Streaming --> Streaming: http GET failed, retry after 1 s
+  Streaming --> Detach: tracer exited (no privileges, CAP_BPF + CAP_PERFMON, or target gone), exit 0
+  Streaming --> Detach: Ctrl-C / SIGTERM, or target exit (dtrace / bpftrace only)
+  Detach --> [*]: SIGINT (bpftrace) or SIGTERM (dtrace), waitpid
   Error --> [*]
 ```
 
@@ -199,7 +207,7 @@ sequenceDiagram
     S->>H: read slot tail % capacity
     S->>H: store tail + 1 (release)
   end
-  Note over C,S: generation bump on collector restart poisons stale consumers.<br/>MVP --serve uses socketpair, hton / ntoh only at that boundary.
+  Note over C,S: generation bump on collector restart poisons stale consumers.<br/>Designed MVP for --serve: socketpair, hton / ntoh only at that boundary.
 ```
 
 ### Privilege separation (designed for `--serve`)
@@ -231,6 +239,7 @@ erDiagram
     u32 requests_deferred
     u64 decode_latency_ns_sum
     u32 decode_latency_n
+    u32 reserved
   }
   HOOK_SCRIPT ||--o{ TOOL : "registers"
   TOOL_REGISTRY ||--o{ TOOL : "holds (in memory)"
@@ -256,7 +265,7 @@ erDiagram
 flowchart LR
   fbsd["FreeBSD node<br/>primary: DTrace attach"]
   linux["Linux nodes (GPU node, CI node, test node)<br/>bpftrace attach or /metrics"]
-  other["Windows, Termux, macOS<br/>/metrics only for now"]
+  other["Windows, Termux, macOS<br/>/metrics or --log-file only for now"]
   fbsd --- spy(("llama.SPY"))
   linux --- spy
   other -.- spy
