@@ -146,6 +146,9 @@ static void CheckSsrfForms() {
       "https://user:secret@127.0.0.1:9/README.md",
       "https://example.com@[::1]/README.md",
       "https://1.2.3.4@127.0.0.1:80/README.md",
+      "https://ex%61mple.com/README.md",
+      "https://xn--bcher-kva.example/README.md",
+      "https://b\xC3\xBCcher.example/README.md",
   };
   llamaspy::UrlFetchOptions opt;
   for (const char* u : urls) {

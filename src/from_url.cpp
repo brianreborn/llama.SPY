@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -113,6 +114,33 @@ bool ParsePort(const char* text, int* port) {
   return true;
 }
 
+bool ParseNumericAddress(const std::string& host, sockaddr_storage* ss, socklen_t* len);
+
+bool HostIsLdhOrLiteral(const std::string& host) {
+  sockaddr_storage ss{};
+  socklen_t len = 0;
+  if (ParseNumericAddress(host, &ss, &len)) return true;
+  if (host.empty() || host.size() > 253 || host.front() == '.' || host.back() == '.') return false;
+  size_t i = 0;
+  while (i < host.size()) {
+    size_t dot = host.find('.', i);
+    std::string lab = host.substr(i, dot == std::string::npos ? std::string::npos : dot - i);
+    if (lab.empty() || lab.size() > 63 || lab.front() == '-' || lab.back() == '-') return false;
+    for (unsigned char c : lab) {
+      bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+      if (!ok) return false;
+    }
+    if (lab.size() >= 4 &&
+        (lab[0] == 'x' || lab[0] == 'X') && (lab[1] == 'n' || lab[1] == 'N') &&
+        lab[2] == '-' && lab[3] == '-') {
+      return false;
+    }
+    if (dot == std::string::npos) break;
+    i = dot + 1;
+  }
+  return true;
+}
+
 bool SplitAuthority(const std::string& hostport, int default_port, UrlParts* out) {
   if (!AuthorityOk(hostport)) return false;
   if (hostport.front() == '[') {
@@ -136,7 +164,7 @@ bool SplitAuthority(const std::string& hostport, int default_port, UrlParts* out
       if (!ParsePort(hostport.c_str() + colon + 1, &out->port)) return false;
     }
   }
-  return !out->host.empty();
+  return !out->host.empty() && HostIsLdhOrLiteral(out->host);
 }
 
 bool ParseHttpUrl(const std::string& url, UrlParts* out) {
@@ -365,23 +393,68 @@ bool LocationSafe(const std::string& loc) {
   return loc.rfind("https://", 0) == 0 || loc.rfind("http://", 0) == 0;
 }
 
-bool HttpExchange(const std::string& url, HttpResp* out, std::string* err, bool allow_private) {
+long MonoMsFetch() {
+  timespec ts{};
+  ::clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+bool ConnectWithin(int fd, const sockaddr* sa, socklen_t len, long deadline_ms, std::string* err) {
+  int fl = ::fcntl(fd, F_GETFL, 0);
+  if (fl < 0 || ::fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+    if (err) *err = "fcntl failed";
+    return false;
+  }
+  int rc = ::connect(fd, sa, len);
+  if (rc != 0 && errno != EINPROGRESS) {
+    if (err) *err = std::string("connect failed: ") + std::strerror(errno);
+    return false;
+  }
+  if (rc != 0) {
+    long remain = deadline_ms - MonoMsFetch();
+    if (remain < 0) remain = 0;
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    int pr = ::poll(&pfd, 1, static_cast<int>(remain));
+    if (pr <= 0) {
+      if (err) *err = pr == 0 ? "http connect timed out" : "poll failed";
+      return false;
+    }
+    int so = 0;
+    socklen_t sl = sizeof(so);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so, &sl) != 0 || so != 0) {
+      if (err) *err = std::string("connect failed: ") + std::strerror(so != 0 ? so : errno);
+      return false;
+    }
+  }
+  ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  return true;
+}
+
+bool HttpExchange(const std::string& url, HttpResp* out, std::string* err, bool allow_private,
+                  long deadline_ms) {
   UrlParts parts;
   if (!ParseHttpUrl(url, &parts)) {
     if (err) *err = "not an http URL";
+    return false;
+  }
+  if (MonoMsFetch() > deadline_ms) {
+    if (err) *err = "http timed out";
     return false;
   }
   std::vector<ResolvedAddr> addrs;
   if (!ResolveHost(parts.host, parts.port, allow_private, &addrs, err)) return false;
   int fd = -1;
   for (const auto& a : addrs) {
+    if (MonoMsFetch() > deadline_ms) break;
     fd = ::socket(a.addr.ss_family, SOCK_STREAM, 0);
     if (fd < 0) continue;
     timeval tv{};
     tv.tv_sec = 20;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (::connect(fd, reinterpret_cast<const sockaddr*>(&a.addr), a.len) == 0) break;
+    if (ConnectWithin(fd, reinterpret_cast<const sockaddr*>(&a.addr), a.len, deadline_ms, err)) break;
     ::close(fd);
     fd = -1;
   }
@@ -408,13 +481,8 @@ bool HttpExchange(const std::string& url, HttpResp* out, std::string* err, bool 
   }
   std::string raw;
   char buf[4096];
-  timespec t0 {};
-  ::clock_gettime(CLOCK_MONOTONIC, &t0);
   while (raw.size() <= kMaxBody + 8192) {
-    timespec now {};
-    ::clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed_ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
-    if (elapsed_ms > 20000) {
+    if (MonoMsFetch() > deadline_ms) {
       ::close(fd);
       if (err) *err = "http read timed out";
       return false;
@@ -474,9 +542,14 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
 
 std::string HttpFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
   std::string current = url;
+  const long deadline = MonoMsFetch() + 20000;
   for (int hop = 0; hop < 3; ++hop) {
+    if (MonoMsFetch() > deadline) {
+      if (err) *err = "http timed out";
+      return {};
+    }
     HttpResp resp;
-    if (!HttpExchange(current, &resp, err, opt.allow_private)) return {};
+    if (!HttpExchange(current, &resp, err, opt.allow_private, deadline)) return {};
     if (resp.status >= 300 && resp.status < 400) {
       std::string loc = HeaderOf(resp.headers, "location");
       if (!LocationSafe(loc)) {
@@ -564,9 +637,9 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
     std::string curl = ResolveTrusted("curl");
     if (curl.empty()) _exit(127);
     std::vector<std::string> args = {
-        curl, "-q", "-fsSL", "--noproxy", "*", "--max-time", "20", "--proto", "=https",
+        curl,     "-q",        "-fsSL", "--noproxy", "*", "--max-time", "20", "--proto", "=https",
         "--max-redirs", "0", "-A", "llamaspy/0.2.0", "--resolve", resolve_spec,
-        "--", curl_url};
+        "-w", "\nllamaspy-http:%{http_code}\n", "--", curl_url};
     std::vector<char*> av;
     av.reserve(args.size() + 1);
     for (auto& s : args) av.push_back(s.data());
@@ -591,6 +664,25 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
   }
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
     if (err && err->empty()) *err = "https fetch failed";
+    return {};
+  }
+  const std::string mark = "\nllamaspy-http:";
+  auto pos = body.rfind(mark);
+  if (pos == std::string::npos || pos + mark.size() + 3 > body.size()) {
+    if (err) *err = "https response had no status";
+    return {};
+  }
+  std::string code = body.substr(pos + mark.size(), 3);
+  for (char c : code) {
+    if (c < '0' || c > '9') {
+      if (err) *err = "https response had no status";
+      return {};
+    }
+  }
+  int http = std::atoi(code.c_str());
+  body.resize(pos);
+  if (http < 200 || http >= 300) {
+    if (err) *err = "https status " + std::to_string(http) + "; not saved";
     return {};
   }
   return body;
@@ -790,16 +882,24 @@ int PublishNoReplace(const std::string& tmp, const std::string& path, const std:
     if (n < 0) {
       if (errno == EINTR) continue;
       int we = errno;
+      struct stat a {};
+      struct stat b {};
+      bool same = ::fstat(fd, &a) == 0 && ::lstat(path.c_str(), &b) == 0 && a.st_dev == b.st_dev &&
+                  a.st_ino == b.st_ino;
       ::close(fd);
-      ::unlink(path.c_str());
+      if (same) ::unlink(path.c_str());
       return we == 0 ? EIO : we;
     }
     off += static_cast<size_t>(n);
   }
   if (::fsync(fd) != 0) {
     int fe = errno;
+    struct stat a {};
+    struct stat b {};
+    bool same = ::fstat(fd, &a) == 0 && ::lstat(path.c_str(), &b) == 0 && a.st_dev == b.st_dev &&
+                a.st_ino == b.st_ino;
     ::close(fd);
-    ::unlink(path.c_str());
+    if (same) ::unlink(path.c_str());
     return fe == 0 ? EIO : fe;
   }
   ::close(fd);

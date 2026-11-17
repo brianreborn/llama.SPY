@@ -58,7 +58,7 @@ inline bool ArmParentDeath(int sig, pid_t expected_ppid) {
   rc = ::procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sig);
 #else
   (void)sig;
-  rc = -1;
+  rc = 0;
 #endif
   if (rc != 0) {
     const char msg[] = "llama.SPY: parent-death signal setup failed\n";

@@ -108,8 +108,8 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
       ::setpgid(0, 0);
       close(pipefd[0]); dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]);
       std::string p = std::to_string(pid_);
-      const char* over = std::getenv("LLAMASPY_BPFTRACE");
-      std::string bin = (over && *over) ? std::string(over) : ResolveTrusted("bpftrace");
+      const char* over = ::geteuid() == 0 ? nullptr : std::getenv("LLAMASPY_BPFTRACE");
+      std::string bin = (over && *over && over[0] == '/') ? std::string(over) : ResolveTrusted("bpftrace");
       if (!bin.empty())
         execl(bin.c_str(), "bpftrace", "-q", "-p", p.c_str(), gen_.c_str(), (char*)nullptr);
       _exit(127);

@@ -462,7 +462,7 @@ bool LinuxStartTicks(uint32_t pid, uint64_t* ticks) {
 #endif
 
 #if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
-bool FreebsdProc(uint32_t pid, uint64_t* sec, uint64_t* usec, int* stat_out) {
+bool FreebsdProc(uint32_t pid, uint64_t* sec, uint64_t* usec, int* stat_out, long* flag_out = nullptr) {
   struct kinfo_proc kp {};
   size_t len = sizeof(kp);
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, static_cast<int>(pid)};
@@ -471,6 +471,7 @@ bool FreebsdProc(uint32_t pid, uint64_t* sec, uint64_t* usec, int* stat_out) {
   if (sec) *sec = static_cast<uint64_t>(kp.ki_start.tv_sec);
   if (usec) *usec = static_cast<uint64_t>(kp.ki_start.tv_usec);
   if (stat_out) *stat_out = kp.ki_stat;
+  if (flag_out) *flag_out = static_cast<long>(kp.ki_flag);
   return true;
 }
 #endif
@@ -600,48 +601,67 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
   }
 
   bool saw_attach_stop = false;
-  // Bounded WNOHANG so an already-stopped target that never reports cannot
-  // hang the read while INT/TERM are blocked. Each foreign stop is continued
-  // with that signal, so a later one is not dropped.
-  for (int spins = 0; spins < 100 && !saw_attach_stop; ++spins) {
-    int st = 0;
-    pid_t w = ::waitpid(static_cast<pid_t>(pid), &st, WNOHANG);
-    if (w == 0) {
-      timespec ts{};
-      ts.tv_nsec = 20000000L;
-      ::nanosleep(&ts, nullptr);
-      continue;
+  auto detach_or_warn = [&](const char* why) {
+    std::string derr;
+    bool det = DetachPtrace(pid, 0, &derr);
+    if (err) {
+      *err = why;
+      if (!det) {
+        *err += "; target may be left stopped";
+        if (!derr.empty()) *err += ": " + derr;
+      }
     }
-    if (w < 0) {
-      if (errno == EINTR) continue;
-      if (err) *err = std::string("waitpid after PT_ATTACH: ") + ErrnoText();
-      DetachPtrace(pid, 0, nullptr);
-      restore();
-      return false;
+  };
+  auto wait_attach_stop = [&](int spins) -> bool {
+    for (int i = 0; i < spins && !saw_attach_stop; ++i) {
+      int st = 0;
+      pid_t w = ::waitpid(static_cast<pid_t>(pid), &st, WNOHANG);
+      if (w == 0) {
+        timespec ts{};
+        ts.tv_nsec = 20000000L;
+        ::nanosleep(&ts, nullptr);
+        continue;
+      }
+      if (w < 0) {
+        if (errno == EINTR) continue;
+        detach_or_warn((std::string("waitpid after PT_ATTACH: ") + ErrnoText()).c_str());
+        restore();
+        return false;
+      }
+      if (WIFEXITED(st) || WIFSIGNALED(st)) {
+        if (err) *err = "target exited during ptrace attach";
+        restore();
+        return false;
+      }
+      if (!WIFSTOPPED(st)) continue;
+      int sig = WSTOPSIG(st);
+      if (sig == SIGSTOP) {
+        saw_attach_stop = true;
+        break;
+      }
+      if (::ptrace(PT_CONTINUE, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), sig) != 0) {
+        detach_or_warn((std::string("ptrace PT_CONTINUE while waiting for SIGSTOP: ") + ErrnoText()).c_str());
+        restore();
+        return false;
+      }
     }
-    if (WIFEXITED(st) || WIFSIGNALED(st)) {
-      if (err) *err = "target exited during ptrace attach";
-      restore();
-      return false;
-    }
-    if (!WIFSTOPPED(st)) continue;
-    int sig = WSTOPSIG(st);
-    if (sig == SIGSTOP) {
-      saw_attach_stop = true;
-      break;
-    }
-    if (::ptrace(PT_CONTINUE, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), sig) != 0) {
-      if (err) *err = std::string("ptrace PT_CONTINUE while waiting for SIGSTOP: ") + ErrnoText();
-      DetachPtrace(pid, 0, nullptr);
-      restore();
-      return false;
-    }
-  }
+    return true;
+  };
+  if (!wait_attach_stop(100)) return false;
+  if (!saw_attach_stop && !wait_attach_stop(100)) return false;
   if (!saw_attach_stop) {
-    if (err) *err = "target did not stop with SIGSTOP after PT_ATTACH";
-    DetachPtrace(pid, 0, nullptr);
+    detach_or_warn("target did not stop with SIGSTOP after PT_ATTACH");
     restore();
     return false;
+  }
+  long flags = 0;
+  int st_after = 0;
+  if (FreebsdProc(pid, nullptr, nullptr, &st_after, &flags)) {
+#ifdef P_STOPPED_SIG
+    was_stopped = (flags & P_STOPPED_SIG) != 0;
+#else
+    (void)st_after;
+#endif
   }
 
   struct ptrace_io_desc iod {};
@@ -873,7 +893,7 @@ uint64_t ComputeBias(const ModuleImage& m) {
 }
 
 int OpenModuleFd(int proc_dir, const std::string& path, const std::string& exe_path,
-                 const std::vector<MapRange>& ranges) {
+                 const std::vector<MapRange>& ranges, std::string* id_err) {
   // Prefer the inode that is actually mapped (map_files), not a path that
   // may have been replaced on disk.
   if (proc_dir >= 0 && !ranges.empty()) {
@@ -911,6 +931,10 @@ int OpenModuleFd(int proc_dir, const std::string& path, const std::string& exe_p
         static_cast<uint64_t>(major(st.st_dev)) != maj ||
         static_cast<uint64_t>(minor(st.st_dev)) != minr) {
       ::close(fd);
+      if (id_err && id_err->empty()) {
+        *id_err = "mapped inode differs from " + path +
+                  "; run with CAP_CHECKPOINT_RESTORE or as root";
+      }
       return -1;
     }
     return fd;
@@ -971,7 +995,7 @@ std::vector<ModuleImage> LoadModules(uint32_t pid, int proc_dir, std::string* er
     m.lowest = m.ranges[0].start;
     for (const auto& r : m.ranges)
       if (r.start < m.lowest) m.lowest = r.start;
-    int mfd = OpenModuleFd(proc_dir, m.path, exe_path, m.ranges);
+    int mfd = OpenModuleFd(proc_dir, m.path, exe_path, m.ranges, err);
     FdReader rd(mfd);
     if (!rd.ok() && !exe_path.empty() && m.path == exe_path) {
       int exe = proc_dir >= 0 ? ::openat(proc_dir, "exe", O_RDONLY | O_CLOEXEC)
@@ -1293,7 +1317,9 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
   // image has a build-id, an empty fp is a mismatch.
   if (!constrained && saw_any_id) {
     r.status = MemStatus::FingerprintMismatch;
-    r.error = "binding has no fp=buildid but a mapped module has a GNU build-id; refusing to read";
+    r.error = "binding has no fp=buildid but a mapped module has a GNU build-id; refusing to read. "
+              "If the target image has no readable build-id, rebuild it with --build-id "
+              "or set fp=buildid:<hex> from scripts/gen-gg-offsets.sh.";
     return r;
   }
   if (constrained && candidates.empty()) {
@@ -1389,9 +1415,21 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
       if (addr >= lo && addr_end <= hi) in_elf = true;
     }
   }
-  // A named mapping of this module, or the ELF image when it is not inside
-  // some other file. FreeBSD BSS often has no path in the vm map.
-  const bool in_map = !in_foreign && (in_own || in_elf);
+  uint64_t own_lo = ~uint64_t{0};
+  uint64_t own_hi = 0;
+  bool have_span = false;
+  if (chosen) {
+    for (const auto& rg : chosen->ranges) {
+      have_span = true;
+      if (rg.start < own_lo) own_lo = rg.start;
+      if (rg.end > own_hi) own_hi = rg.end;
+    }
+  }
+  uint64_t cap = 0;
+  const bool within_1mib = have_span && add_u64(own_hi, 1ull << 20, &cap) && addr >= own_lo &&
+                           addr_end <= cap;
+  // Named mapping, or the ELF image only within 1 MiB past that mapping.
+  const bool in_map = !in_foreign && (in_own || (in_elf && within_1mib));
   if (!in_map) {
     std::ostringstream o;
     o << "resolved address is outside the module mappings";

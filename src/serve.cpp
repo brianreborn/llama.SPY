@@ -1071,6 +1071,10 @@ void PrepareChild(pid_t expected_ppid) {
 }
 
 int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>& collector) {
+#if !defined(__linux__) && !defined(__FreeBSD__) && !defined(LLAMASPY_FREEBSD)
+  std::cerr << "llama.SPY: --serve is only supported on Linux and FreeBSD\n";
+  return 2;
+#else
   std::string policy = ListenerPolicyError(cfg.listen, cfg.api_key);
   if (!policy.empty()) {
     std::cerr << "llama.SPY: " << policy;
@@ -1168,6 +1172,7 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
     (void)wr;
   }
   return Reap(coll, serve);
+#endif
 }
 
 }  // namespace llamaspy

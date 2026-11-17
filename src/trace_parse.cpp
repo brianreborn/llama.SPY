@@ -51,8 +51,8 @@ bool BpftraceOnPath() {
 #if defined(_WIN32)
   return false;
 #else
-  const char* over = std::getenv("LLAMASPY_BPFTRACE");
-  if (over && *over && ::access(over, X_OK) == 0) return true;
+  const char* over = ::geteuid() == 0 ? nullptr : std::getenv("LLAMASPY_BPFTRACE");
+  if (over && over[0] == '/' && ::access(over, X_OK) == 0) return true;
   return !ResolveTrusted("bpftrace").empty();
 #endif
 }

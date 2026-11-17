@@ -10,7 +10,17 @@
 #include <unistd.h>
 
 #if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+#  include <sys/proc.h>
 #  include <sys/sysctl.h>
+#  include <sys/user.h>
+static bool ProcTraced(pid_t pid, int* kstat) {
+  struct kinfo_proc kp {};
+  size_t len = sizeof(kp);
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, static_cast<int>(pid)};
+  if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len < sizeof(kp)) return true;
+  if (kstat) *kstat = kp.ki_stat;
+  return (kp.ki_flag & P_TRACED) != 0;
+}
 #endif
 
 static std::string SelfExe() {
@@ -191,6 +201,31 @@ int main() {
       else ::usleep(20000);
     }
     CHECK(still_stopped);
+    int kst = 0;
+    CHECK(!ProcTraced(child, &kst));
+    CHECK(kst == SSTOP);
+  }
+  pid_t running = ::fork();
+  if (running == 0) {
+    for (;;) ::pause();
+  }
+  if (running > 0) {
+    ::usleep(50000);
+    auto live = llamaspy::ReadBinding(static_cast<uint32_t>(running), u64,
+                                      llamaspy::MemBackend::PtraceIo);
+    if (live.status != llamaspy::MemStatus::Ok) {
+      std::cerr << "running ptrace read failed: " << live.error << "\n";
+      ++g_fail;
+    } else {
+      int pst = 0;
+      pid_t pw = ::waitpid(running, &pst, WNOHANG | WUNTRACED);
+      CHECK(pw == 0);
+      int kst = 0;
+      CHECK(!ProcTraced(running, &kst));
+      CHECK(kst != SSTOP);
+    }
+    ::kill(running, SIGKILL);
+    ::waitpid(running, nullptr, 0);
   }
 #endif
 
