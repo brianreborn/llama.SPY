@@ -149,7 +149,7 @@ std::optional<std::string> HttpGet(const std::string& url, int timeout_sec,
   std::ostringstream req;
   req << "GET " << parts.path << " HTTP/1.0\r\n"
       << "Host: " << parts.host << "\r\n"
-      << "User-Agent: llamaspy/0.1\r\n"
+      << "User-Agent: llamaspy/0.2.0\r\n"
       << "Accept: */*\r\n";
   if (!bearer_token.empty()) {
     req << "Authorization: Bearer " << bearer_token << "\r\n";

@@ -10,7 +10,7 @@ few extras is enough for HookScript `js_body`).
 do what you want, keep copyright notice).
 
 **Security posture for llama.SPY:** the host API exposes only `registerTool`,
-`log`, and `readBinding` (stub). No `require`, no network, no filesystem
+`log`, and `readBinding` (read-only). No `require`, no network, no filesystem
 builtins are injected. Operators still review HookScripts before load.
 
 CMake compiles `duktape.c` into `llamaspy` when `LLAMASPY_JS=ON` (default).

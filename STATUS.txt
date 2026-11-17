@@ -1,32 +1,35 @@
-test2 (2026-10-30): Linux bpftrace live-attach backend + bin/run-attach-smoke.sh.
-Prebuilts cross-compiled with zig 0.17 (Linux static musl; FreeBSD x86_64) because
-miryam/angel were offline; FreeBSD binary not yet run on angel.
+0.2.0 (2026-11-17): remaining stubs implemented.
 
-llama.SPY — release status
-Version: 0.1.0-test2
-Updated: 2026-10-27 America/Los_Angeles
+llama.SPY - release status
+Version: 0.2.0
+Updated: 2026-11-17
 
 Product: llama.SPY (binary: llamaspy)
 Focus: FreeBSD-first realtime observability for a running llama.cpp process.
-
-This tag ships a downloadable Linux amd64 prebuilt test bundle. FreeBSD amd64
-prebuilt is produced by CI (or qodesh) and attached when available.
+Read-only by design. The target is never written.
 
 Working in this release
 - HTTP /metrics (+ optional /slots) observability HUD
 - HookScript (JSON) + LLMS1 Game Genie dialect
-- Duktape js_body: registerTool / --list-tools / --call-tool
+- Duktape js_body: registerTool / log / readBinding / --list-tools / --call-tool
+- Read-only mem backend for bindings (Linux process_vm_readv, then /proc/PID/mem;
+  FreeBSD /proc/PID/mem or ptrace PT_IO PIOD_READ_D). Symbol + displacement from
+  the module load bias. Build-id mismatch refuses the read.
+  scripts/gen-gg-offsets.sh emits real LLMS1 lines from nm/readelf.
 - DTrace script packaging + path resolution (live on FreeBSD)
+- Linux bpftrace uprobe provider (scripts/llama_decode.bt), HTTP fallback kept
+- --serve privilege-separated listener (socketpair, dual child, parent reaper).
+  Loopback only. API key required (--api-key or --api-key-file). 0.0.0.0 refused.
+- --from-url fetches a README or HookScript and writes a draft. js_body is emptied.
+  Remote code is never executed.
 - i18n en/ja (compiled-in tables; locales/*.json shipped for reference)
 
-Known stubs (intentional for test1)
-- Mem read backend for GG bindings (readBinding returns metadata only)
-- --serve privilege-separated collector (see docs/PRIVSEP.md)
-- --from-url remote HookScript draft (no remote exec)
-- Linux live attach: bpftrace-linux provider (uprobes on llama_decode), parity with FreeBSD dtrace
-- auto --pid: dtrace on FreeBSD, bpftrace on Linux, then http/log
+Not in this release
+- SHM SnoopV1 ring (socketpair only for --serve)
+- Fullscreen TUI
+- Live FreeBSD DTrace against a real llama-server (needs a FreeBSD host)
+- Live Linux bpftrace against a decoding llama-server (needs root or CAP_BPF and a target)
 
-Smoke (Linux prebuilt)
+Smoke
+  cmake -B build && cmake --build build && ctest --test-dir build --output-on-failure
   ./bin/run-hook-smoke.sh
-  # or:
-  ./bin/llamaspy --hook-file examples/hook.sample.json --call-tool echo '{"msg":"hi"}'

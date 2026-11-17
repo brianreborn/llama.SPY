@@ -7,7 +7,9 @@
 // On non-FreeBSD hosts (e.g. this Linux CI/box): the provider compiles as a
 // stub that returns AttachStatus::NotSupported so CMake still links.
 
+#include "llamaspy/proc_util.hpp"
 #include "llamaspy/telemetry_provider.hpp"
+#include "llamaspy/trace_parse.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -43,7 +45,8 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
     // Spawn: dtrace -p PID -s script
     // TODO: prefer libdtrace embedding for tighter SnoopV1 integration.
     int pipefd[2];
-    if (pipe(pipefd) != 0) return AttachStatus::Failed;
+    if (PipeCloexec(pipefd) != 0) return AttachStatus::Failed;
+    const pid_t self = ::getpid();
     child_ = fork();
     if (child_ < 0) {
       close(pipefd[0]);
@@ -51,12 +54,17 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       return AttachStatus::Failed;
     }
     if (child_ == 0) {
+      ArmParentDeath(SIGTERM, self);
+      ::setpgid(0, 0);
       close(pipefd[0]);
       dup2(pipefd[1], STDOUT_FILENO);
       close(pipefd[1]);
       std::string pid_s = std::to_string(pid_);
-      execlp("dtrace", "dtrace", "-p", pid_s.c_str(), "-s", script_.c_str(),
-             static_cast<char*>(nullptr));
+      const char* over = ::geteuid() == 0 ? nullptr : std::getenv("LLAMASPY_DTRACE");
+      std::string bin = (over && *over && over[0] == '/') ? std::string(over) : ResolveTrusted("dtrace");
+      if (!bin.empty())
+        execl(bin.c_str(), "dtrace", "-p", pid_s.c_str(), "-s", script_.c_str(),
+              static_cast<char*>(nullptr));
       _exit(127);
     }
     close(pipefd[1]);
@@ -74,26 +82,24 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
   bool StreamMetrics(MetricsCallback cb) override {
     if (!attached_ || !fp_) return false;
     char line[512];
+    errno = 0;
     if (!fgets(line, sizeof(line), fp_)) {
-      // EOF or error — stop
+      if (ferror(fp_) && errno == EINTR) {
+        clearerr(fp_);
+        return true;
+      }
       return false;
     }
-    if (line[0] == '#') {
-      // comment / banner from script
-      return true;
-    }
-    unsigned long long ts = 0, n = 0, avg = 0;
-    if (std::sscanf(line, "%llu %llu %llu", &ts, &n, &avg) != 3) {
-      return true;
-    }
+    TraceSample sample;
+    if (!ParseTraceSummaryLine(line, &sample)) return true;
     SnoopV1Frame f{};
     f.magic = kSnoopMagic;
     f.version = kSnoopVersion;
-    f.timestamp_ns = ts;
+    f.timestamp_ns = sample.timestamp_ns;
     f.pid = pid_;
-    f.decode_count = static_cast<uint32_t>(n);
-    f.decode_latency_ns_sum = static_cast<uint64_t>(avg) * n;
-    f.decode_latency_n = static_cast<uint32_t>(n);
+    f.decode_count = static_cast<uint32_t>(sample.decode_count);
+    f.decode_latency_ns_sum = sample.avg_latency_ns * sample.decode_count;
+    f.decode_latency_n = static_cast<uint32_t>(sample.decode_count);
     // Self-calculated tok/s left 0 here; TUI/collector may derive from deltas.
     cb(f);
     return true;
@@ -106,8 +112,7 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       fp_ = nullptr;
     }
     if (child_ > 0) {
-      kill(child_, SIGTERM);
-      waitpid(child_, nullptr, 0);
+      ReapChild(child_, SIGTERM);
       child_ = -1;
     }
   }
@@ -131,8 +136,10 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
 
   AttachStatus Attach(const AttachOptions&) override {
     // Primary path exists only on FreeBSD. Linux/macOS/Windows peers land later.
-    std::cerr << "[dtrace-freebsd] stub: not compiled on this OS "
-                 "(build on FreeBSD for pid provider + scripts/llama_decode.d)\n";
+    std::cerr << "[dtrace-freebsd] not supported on this OS. "
+                 "On Linux use --backend bpftrace (uprobe on llama_decode) or "
+                 "--backend http --metrics-url URL. "
+                 "Build on FreeBSD for the pid provider and scripts/llama_decode.d.\n";
     return AttachStatus::NotSupported;
   }
 

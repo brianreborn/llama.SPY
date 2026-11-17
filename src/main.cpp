@@ -1,9 +1,12 @@
 #include <filesystem>
 #include <vector>
 #include <cstdlib>
+#include "llamaspy/from_url.hpp"
 #include "llamaspy/game_genie.hpp"
 #include "llamaspy/hook_script.hpp"
 #include "llamaspy/js_engine.hpp"
+#include "llamaspy/mem_read.hpp"
+#include "llamaspy/serve.hpp"
 #include "llamaspy/tool_registry.hpp"
 #include "llamaspy/i18n.hpp"
 #include "llamaspy/metrics_http.hpp"
@@ -20,9 +23,23 @@
 #include <sstream>
 #include <string>
 
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 namespace {
 std::atomic<bool> g_run{true};
 void OnSignal(int) { g_run = false; }
+
+void InstallStopSignals() {
+  struct sigaction sa {};
+  sa.sa_handler = OnSignal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;  // no SA_RESTART: blocking reads return EINTR
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+  sigaction(SIGHUP, &sa, nullptr);
+}
 
 void Usage(const char* argv0) {
   std::cerr
@@ -30,7 +47,12 @@ void Usage(const char* argv0) {
       << llamaspy::T("help.usage") << " " << argv0
       << " [--pid N] [--metrics-url URL] [--backend auto|http|dtrace|bpftrace|log]\n"
       << "         [--slots-url URL] [--api-key KEY] [--log-file PATH]\n"
-      << "         [--dtrace-script PATH] [--no-hud] [--hook-file PATH|-] [--gg-file PATH|-]\n         [--list-tools] [--call-tool NAME [json-args]] [--from-url URL] [--lang xx]\n"
+      << "         [--dtrace-script PATH] [--no-hud] [--hook-file PATH|-] [--gg-file PATH|-]\n"
+      << "         [--list-tools] [--call-tool NAME [json-args]] [--from-url URL]\n"
+      << "         [--draft-out PATH] [--draft-force] [--from-url-allow-http]\n"
+      << "         [--from-url-allow-private] [--serve [127.0.0.1:9100]]\n"
+      << "         [--listen-api-key KEY] [--listen-api-key-file PATH] [--api-key-file PATH]\n"
+      << "         [--lang xx]\n"
       << "\n"
       << "  " << llamaspy::T("help.primary") << "\n"
       << "  " << llamaspy::T("help.fallback") << "\n"
@@ -46,9 +68,16 @@ void Usage(const char* argv0) {
       << "  " << llamaspy::T("help.list_tools") << "\n"
       << "  " << llamaspy::T("help.call_tool") << "\n"
       << "  " << llamaspy::T("help.from_url") << "\n"
+      << "  --draft-out PATH: where --from-url writes the draft (default llamaspy-hook.draft.json)\n"
       << "\n"
       << "  " << llamaspy::T("help.serve") << "\n"
-      << "  collector never binds the net — see docs/PRIVSEP.md.\n";
+      << "  --api-key / --api-key-file: Bearer for outbound llama-server HTTP only.\n"
+      << "    Prefer --api-key-file (mode 0600, not a symlink). --api-key is visible in ps.\n"
+      << "  --listen-api-key-file PATH: required for --serve (mode 0600, not a symlink).\n"
+      << "    --listen-api-key is visible in ps. Neither is sent outbound.\n"
+      << "  --from-url is https and public hosts only, unless --from-url-allow-http\n"
+      << "    or --from-url-allow-private. --draft-force overwrites an existing draft.\n"
+      << "  collector never binds the net; see docs/PRIVSEP.md.\n";
 }
 
 void PrintFrameLine(const llamaspy::SnoopV1Frame& f) {
@@ -114,6 +143,59 @@ std::string ResolveDtraceScript(const std::string& cli, const char* argv0) {
   for (auto& p : c) if (fs::is_regular_file(p, ec)) return p.lexically_normal().string();
   return "scripts/llama_decode.d";  // nothing found; dtrace will report error
 }
+
+std::unique_ptr<llamaspy::TelemetryProvider> MakeSelected(const std::string& backend,
+                                                         const llamaspy::AttachOptions& opts,
+                                                         std::string* err) {
+  using llamaspy::MakeBpftraceLinuxProvider;
+  using llamaspy::MakeDtraceFreeBsdProvider;
+  using llamaspy::MakeHttpMetricsProvider;
+  using llamaspy::MakeLogTimingsProvider;
+  if (backend == "dtrace") return MakeDtraceFreeBsdProvider();
+  if (backend == "bpftrace" || backend == "uprobe") return MakeBpftraceLinuxProvider();
+  if (backend == "http") return MakeHttpMetricsProvider();
+  if (backend == "log") return MakeLogTimingsProvider();
+  if (backend == "auto") {
+#if defined(LLAMASPY_FREEBSD) || defined(__FreeBSD__)
+    if (opts.pid != 0) return MakeDtraceFreeBsdProvider();
+#else
+    if (opts.pid != 0) {
+#  if defined(__linux__)
+      return MakeBpftraceLinuxProvider();
+#  else
+      if (err) *err = "auto: no live-attach backend on this OS; use --metrics-url";
+      return nullptr;
+#  endif
+    }
+#endif
+    if (!opts.metrics_url.empty()) return MakeHttpMetricsProvider();
+    if (!opts.log_file.empty()) return MakeLogTimingsProvider();
+    if (err) {
+#if defined(LLAMASPY_FREEBSD) || defined(__FreeBSD__)
+      *err = "auto: need --pid (dtrace), --metrics-url, or --log-file";
+#else
+      *err = "auto: need --pid (bpftrace), --metrics-url, or --log-file";
+#endif
+    }
+    return nullptr;
+  }
+  if (err) *err = "unknown backend: " + backend;
+  return nullptr;
+}
+
+llamaspy::AttachStatus AttachWithFallback(std::unique_ptr<llamaspy::TelemetryProvider>& provider,
+                                          const std::string& backend,
+                                          const llamaspy::AttachOptions& opts) {
+  auto st = provider->Attach(opts);
+  if (st == llamaspy::AttachStatus::Ok) return st;
+  if (backend == "auto" && !opts.metrics_url.empty()) {
+    std::cerr << "live attach via " << provider->name()
+              << " failed; falling back to HTTP /metrics\n";
+    provider = llamaspy::MakeHttpMetricsProvider();
+    return provider->Attach(opts);
+  }
+  return st;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -128,6 +210,15 @@ int main(int argc, char** argv) {
   std::string gg_file;
   std::string hook_file;
   std::string from_url;
+  std::string draft_out;
+  std::string api_key_file;
+  std::string listen_api_key;
+  std::string listen_api_key_file;
+  std::string serve_spec;
+  bool want_serve = false;
+  bool draft_force = false;
+  bool from_url_allow_http = false;
+  bool from_url_allow_private = false;
   bool list_tools = false;
   std::string call_tool;
   std::string call_tool_args = "{}";
@@ -154,7 +245,16 @@ int main(int argc, char** argv) {
       want_metrics = true;
     } else if (a == "--api-key") {
       api_key = need("--api-key");
-      // auth alone does not imply attach; pairs with --metrics-url
+      volatile char* wipe = argv[i];
+      while (wipe && *wipe) *wipe++ = ' ';
+    } else if (a == "--api-key-file") {
+      api_key_file = need("--api-key-file");
+    } else if (a == "--listen-api-key") {
+      listen_api_key = need("--listen-api-key");
+      volatile char* wipe = argv[i];
+      while (wipe && *wipe) *wipe++ = ' ';
+    } else if (a == "--listen-api-key-file") {
+      listen_api_key_file = need("--listen-api-key-file");
     } else if (a == "--log-file") {
       log_file = need("--log-file");
       want_metrics = true;
@@ -184,15 +284,24 @@ int main(int argc, char** argv) {
       }
     } else if (a == "--from-url") {
       from_url = need("--from-url");
+    } else if (a == "--draft-out") {
+      draft_out = need("--draft-out");
+    } else if (a == "--draft-force") {
+      draft_force = true;
+    } else if (a == "--from-url-allow-http") {
+      from_url_allow_http = true;
+    } else if (a == "--from-url-allow-private") {
+      from_url_allow_private = true;
     } else if (a == "--lang") {
       llamaspy::I18nSetLang(need("--lang"));
     } else if (a == "--no-hud") {
       use_hud = false;
     } else if (a == "--serve") {
-      // MVP stub only — real Capsicum/socketpair microservice is docs/PRIVSEP.md.
-      std::cerr << "llama.SPY: --serve not implemented yet "
-                   "(privilege-separated microservice; see docs/PRIVSEP.md)\n";
-      return 2;
+      want_serve = true;
+      want_metrics = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        serve_spec = argv[++i];
+      }
     } else if (a == "-h" || a == "--help") {
       Usage(argv[0]);
       return 0;
@@ -203,23 +312,59 @@ int main(int argc, char** argv) {
     }
   }
 
-  // --from-url stub: never fetches or executes remotely.
-  if (!from_url.empty()) {
-    std::cerr << "llama.SPY: --from-url " << from_url << "\n"
-              << llamaspy::T("from_url.stub") << "\n"
-              << "  (review-before-load; no blind remote execute)\n";
-    return 2;
+  auto load_key_file = [](const std::string& path, std::string* dest) {
+    std::string kerr;
+    std::string key = llamaspy::ReadApiKeyFile(path, &kerr);
+    if (key.empty()) {
+      std::cerr << "llama.SPY: " << kerr << "\n";
+      std::exit(2);
+    }
+    *dest = std::move(key);
+  };
+  if (!api_key_file.empty()) {
+    if (!api_key.empty()) {
+      std::cerr << "llama.SPY: --api-key is set; ignoring --api-key-file\n";
+    } else {
+      load_key_file(api_key_file, &api_key);
+    }
+  }
+  if (!listen_api_key_file.empty()) {
+    if (!listen_api_key.empty()) {
+      std::cerr << "llama.SPY: --listen-api-key is set; ignoring --listen-api-key-file\n";
+    } else {
+      load_key_file(listen_api_key_file, &listen_api_key);
+    }
   }
 
+  // Fetch and write a draft. Never load it and never execute remote code.
+  if (!from_url.empty()) {
+    llamaspy::UrlFetchOptions fopt;
+    fopt.allow_http = from_url_allow_http;
+    fopt.allow_private = from_url_allow_private;
+    auto drafted = llamaspy::WriteHookDraftFromUrl(from_url, draft_out, draft_force, fopt);
+    if (!drafted.ok) {
+      std::cerr << "llama.SPY: --from-url failed: " << drafted.error << "\n"
+                << "Remote content was not executed.\n";
+      return 1;
+    }
+    std::cout << "Wrote HookScript draft (not loaded, not executed): " << drafted.path << "\n"
+              << "Review it, then load locally with --hook-file. js_body is empty.\n";
+    return 0;
+  }
+
+  llamaspy::SetMemTargetPid(pid);
+
+  llamaspy::HookScript hook;
   bool have_hook = false;
   if (!hook_file.empty()) {
-    auto hook = llamaspy::LoadHookScriptFile(hook_file);
+    hook = llamaspy::LoadHookScriptFile(hook_file);
     std::cout << llamaspy::FormatHookScript(hook);
     if (!hook.ok && hook.tools.empty() && hook.codebook.bindings.empty() &&
         hook.js_body.empty()) {
       std::cerr << "HookScript load failed\n";
       return 1;
     }
+    llamaspy::SetMemCodebook(&hook.codebook);
     std::size_t n = llamaspy::ApplyHookTools(hook);
     std::cerr << "[" << llamaspy::T("hook.loaded") << "] registered " << n
               << " tool(s) from manifest\n";
@@ -264,6 +409,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     have_gg = true;
+    llamaspy::SetMemCodebook(&gg);
     // Dump-only mode: --gg-file without metrics attach flags.
     if (!want_metrics && metrics_url.empty() && pid == 0) {
       // Soft parse errors still exit 0 if at least one binding loaded; hard empty fail already returned 1.
@@ -275,7 +421,6 @@ int main(int argc, char** argv) {
       }
       return 0;
     }
-    // Combined mode: note that mem apply is stubbed.
     std::string detail;
     auto st = llamaspy::ApplyReadOnly(pid, gg, &detail);
     std::cerr << "[gg] ApplyReadOnly status=" << static_cast<int>(st) << "\n"
@@ -293,54 +438,6 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  std::signal(SIGINT, OnSignal);
-  std::signal(SIGTERM, OnSignal);
-
-  std::unique_ptr<llamaspy::TelemetryProvider> provider;
-  if (backend == "dtrace") {
-    provider = llamaspy::MakeDtraceFreeBsdProvider();
-  } else if (backend == "bpftrace" || backend == "uprobe") {
-    provider = llamaspy::MakeBpftraceLinuxProvider();
-  } else if (backend == "http") {
-    provider = llamaspy::MakeHttpMetricsProvider();
-  } else if (backend == "log") {
-    // Hook: --backend log --log-file PATH (src/log_timings.cpp); no FD hijack yet.
-    provider = llamaspy::MakeLogTimingsProvider();
-  } else if (backend == "auto") {
-    // DTrace path resolution / LLAMASPY_FREEBSD ifdef owned by another worker — keep guard.
-#if defined(LLAMASPY_FREEBSD) || defined(__FreeBSD__)
-    if (pid != 0) {
-      provider = llamaspy::MakeDtraceFreeBsdProvider();
-    } else if (!metrics_url.empty()) {
-      provider = llamaspy::MakeHttpMetricsProvider();
-    } else if (!log_file.empty()) {
-      provider = llamaspy::MakeLogTimingsProvider();
-    } else {
-      std::cerr << "auto: need --pid (dtrace), --metrics-url, or --log-file\n";
-      return 2;
-    }
-#else
-    if (pid != 0) {
-#  if defined(__linux__)
-      provider = llamaspy::MakeBpftraceLinuxProvider();
-#  else
-      std::cerr << "auto: no live-attach backend on this OS; use --metrics-url\n";
-      return 2;
-#  endif
-    } else if (!metrics_url.empty()) {
-      provider = llamaspy::MakeHttpMetricsProvider();
-    } else if (!log_file.empty()) {
-      provider = llamaspy::MakeLogTimingsProvider();
-    } else {
-      std::cerr << "auto: need --pid (bpftrace), --metrics-url, or --log-file\n";
-      return 2;
-    }
-#endif
-  } else {
-    std::cerr << "unknown backend: " << backend << "\n";
-    return 2;
-  }
-
   llamaspy::AttachOptions opts;
   opts.pid = pid;
   opts.metrics_url = metrics_url;
@@ -349,7 +446,54 @@ int main(int argc, char** argv) {
   opts.log_file = log_file;
   opts.dtrace_script_path = ResolveDtraceScript(dtrace_script, argv[0]);
 
-  auto st = provider->Attach(opts);
+  std::string sel_err;
+  auto provider = MakeSelected(backend, opts, &sel_err);
+  if (!provider) {
+    std::cerr << sel_err << "\n";
+    return 2;
+  }
+
+  if (want_serve) {
+    if (pid == 0 && metrics_url.empty() && log_file.empty()) {
+      std::cerr << "--serve needs --pid, --metrics-url, or --log-file\n";
+      return 2;
+    }
+    llamaspy::ServeConfig cfg;
+    cfg.listen = llamaspy::ParseListenSpec(serve_spec);
+    cfg.api_key = listen_api_key;
+    // Collector attaches first, then drops bind/listen/accept. Strict mode
+    // (no new connect/open, Capsicum when available) is only for live tracers.
+    return llamaspy::RunPrivsepServe(cfg, [&](int ipc) -> int {
+      InstallStopSignals();
+      int fl = ::fcntl(ipc, F_GETFL, 0);
+      if (fl >= 0) ::fcntl(ipc, F_SETFL, fl | O_NONBLOCK);
+      auto st = AttachWithFallback(provider, backend, opts);
+      if (st != llamaspy::AttachStatus::Ok) {
+        std::cerr << "Attach failed via " << provider->name()
+                  << " status=" << static_cast<int>(st) << "\n";
+        return 1;
+      }
+      const std::string pname = provider->name();
+      const bool live = pname == "dtrace-freebsd" || pname == "bpftrace-linux";
+      llamaspy::SandboxCollector(ipc, live);
+      std::cerr << "Attached via " << provider->name() << "\n";
+      while (g_run.load()) {
+        bool cont = provider->StreamMetrics([&](const llamaspy::SnoopV1Frame& f) {
+          llamaspy::SnoopV1Frame wire = llamaspy::snoop_hton(f);
+          ssize_t n = ::send(ipc, &wire, sizeof(wire), MSG_NOSIGNAL);
+          if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+          if (n != static_cast<ssize_t>(sizeof(wire))) g_run = false;
+        });
+        if (!cont) break;
+      }
+      provider->Detach();
+      return 0;
+    });
+  }
+
+  InstallStopSignals();
+
+  auto st = AttachWithFallback(provider, backend, opts);
   if (st != llamaspy::AttachStatus::Ok) {
     std::cerr << "Attach failed via " << provider->name()
               << " status=" << static_cast<int>(st) << "\n";

@@ -1,6 +1,7 @@
 #pragma once
 // Game Genie v1 — paste-in read-only offset codes for llama.SPY.
-// Format: docs/GAME_GENIE.md. No memory writes; ApplyReadOnly is a stub.
+// Format: docs/GAME_GENIE.md. No memory writes.
+// ApplyReadOnly is implemented in src/mem_read.cpp (read-only).
 
 #include <cstdint>
 #include <string>
@@ -54,7 +55,13 @@ enum class GgApplyStatus : int {
   NotImplemented = 1,
   InvalidArg = 2,
   Empty = 3,
+  PermissionDenied = 4,
+  FingerprintMismatch = 5,
+  ReadError = 6,
 };
+
+// Byte width implied by a value type. 0 when the type is Unknown.
+uint32_t DefaultWidth(GgValueType t);
 
 // Parse a full document (file body or stdin dump). Lines starting with '#'
 // and blank lines are ignored. Unknown key=value pairs are ignored.
@@ -69,7 +76,9 @@ std::string FormatCodebook(const GgCodebook& book);
 const char* GgValueTypeName(GgValueType t);
 GgValueType GgValueTypeFromString(std::string_view s);
 
-// Stub: future Linux process_vm_readv / FreeBSD mem read. Lists bindings only.
+// Read every binding from pid. Never writes. Defined in src/mem_read.cpp.
+// Fingerprint mismatch refuses the read. off is a displacement from the
+// resolved symbol (0 = the symbol itself). See scripts/gen-gg-offsets.sh.
 GgApplyStatus ApplyReadOnly(uint32_t pid, const GgCodebook& book, std::string* detail_out);
 
 } // namespace llamaspy

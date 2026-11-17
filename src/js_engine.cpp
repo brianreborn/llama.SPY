@@ -1,4 +1,5 @@
 #include "llamaspy/js_engine.hpp"
+#include "llamaspy/mem_read.hpp"
 #include "llamaspy/tool_registry.hpp"
 
 #include <cstring>
@@ -51,21 +52,10 @@ duk_ret_t NativeReadBinding(duk_context* ctx) {
   if (codebook) {
     for (const auto& b : codebook->bindings) {
       if (b.symbol == sym) {
-        duk_push_object(ctx);
-        duk_push_string(ctx, b.symbol.c_str());
-        duk_put_prop_string(ctx, -2, "sym");
-        duk_push_number(ctx, static_cast<double>(b.offset));
-        duk_put_prop_string(ctx, -2, "offset");
-        duk_push_int(ctx, static_cast<duk_int_t>(b.width));
-        duk_put_prop_string(ctx, -2, "width");
-        duk_push_string(ctx, GgValueTypeName(b.type));
-        duk_put_prop_string(ctx, -2, "type");
-        duk_push_true(ctx);
-        duk_put_prop_string(ctx, -2, "declared");
-        duk_push_null(ctx);
-        duk_put_prop_string(ctx, -2, "value");
-        duk_push_string(ctx, "mem backend not implemented");
-        duk_put_prop_string(ctx, -2, "error");
+        BindingRead rd = ReadBinding(MemTargetPid(), b);
+        std::string json = BindingReadJson(rd);
+        duk_push_lstring(ctx, json.data(), json.size());
+        duk_json_decode(ctx, -1);
         return 1;
       }
     }
@@ -330,10 +320,25 @@ bool CallTool(std::string_view name, std::string_view json_args,
 
   if (h.rfind("read_binding:", 0) == 0) {
     std::string sym = h.substr(std::strlen("read_binding:"));
-    std::ostringstream o;
-    o << "{\"ok\":false,\"handler\":\"read_binding\",\"sym\":\"" << sym
-      << "\",\"error\":\"mem backend not implemented\"}";
-    if (result_json) *result_json = o.str();
+    const GgCodebook* book = MemCodebook();
+    if (!book) {
+      if (result_json) {
+        *result_json =
+            "{\"ok\":false,\"error\":\"no codebook loaded\",\"sym\":\"" + sym + "\"}";
+      }
+      return true;
+    }
+    for (const auto& b : book->bindings) {
+      if (b.symbol == sym) {
+        BindingRead rd = ReadBinding(MemTargetPid(), b);
+        if (result_json) *result_json = BindingReadJson(rd);
+        return true;
+      }
+    }
+    if (result_json) {
+      *result_json = "{\"ok\":false,\"error\":\"binding not in codebook\",\"sym\":\"" + sym +
+                     "\"}";
+    }
     return true;
   }
 

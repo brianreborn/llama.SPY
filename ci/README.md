@@ -1,5 +1,9 @@
 # CI recipes
 
+`.github/workflows/ci.yml` builds and runs `ctest` on Linux and, via
+`vmactions/freebsd-vm`, on FreeBSD 14.2. Live DTrace / bpftrace against a
+running llama-server is not part of that job.
+
 `freebsd-prebuilt.yml` is the FreeBSD amd64 prebuilt workflow intended for
 `.github/workflows/freebsd-prebuilt.yml`.
 

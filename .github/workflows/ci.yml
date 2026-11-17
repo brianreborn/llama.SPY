@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    name: Linux build and test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake python3
+
+      - name: Configure, build, test
+        run: |
+          set -eu
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          ctest --test-dir build --output-on-failure --timeout 60
+
+  aarch64:
+    runs-on: ubuntu-latest
+    name: Linux aarch64 cross build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Packages
+        run: sudo apt-get update && sudo apt-get install -y cmake g++-aarch64-linux-gnu
+
+      - name: Configure and build
+        run: |
+          set -eu
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+          cmake --build build -j"$(nproc)"
+
+  freebsd:
+    runs-on: ubuntu-latest
+    name: FreeBSD build and test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.2"
+          usesh: true
+          prepare: |
+            pkg install -y cmake llvm git python3
+          run: |
+            set -eu
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build -j"$(sysctl -n hw.ncpu)"
+            ctest --test-dir build --output-on-failure --timeout 90

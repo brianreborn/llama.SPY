@@ -34,11 +34,12 @@ Implementations:
 
 | Backend | Role | Status in scaffold |
 |---------|------|--------------------|
-| `dtrace-freebsd` | Primary | Real spawn+parse on `__FreeBSD__`; stub elsewhere |
+| `dtrace-freebsd` | Primary | Real spawn+parse on `__FreeBSD__`; NotSupported elsewhere |
+| `bpftrace-linux` | Linux live attach | uprobe on `llama_decode` (`scripts/llama_decode.bt`) |
 | `http-metrics` | Portable fallback | POSIX sockets + Prometheus text parser |
-| (later) eBPF / Frida / Win32 / stderr | Peers | Not in this tree yet |
+| `log-timings` | Cooperative log | `--log-file`; no FD hijack |
 
-`auto` on FreeBSD prefers DTrace when `--pid` is set; elsewhere requires `--metrics-url`.
+`auto` on FreeBSD prefers DTrace when `--pid` is set. On Linux, `auto --pid` uses bpftrace and falls back to HTTP when `--metrics-url` is also set and live attach fails.
 
 ## SnoopV1 frame layout
 
@@ -118,8 +119,9 @@ Also support a mutex + condition-variable ring for hosts/workloads where lockles
 
 Collector must not listen on the network. Web/TUI never holds `dtrace` or ptrace credentials.
 
-Concrete FreeBSD Capsicum + `socketpair` sequence (and Linux landlock/seccomp sketch):
-see [PRIVSEP.md](PRIVSEP.md). `--serve` is intentionally unimplemented in MVP.
+Concrete FreeBSD Capsicum + `socketpair` sequence (and the Linux landlock/seccomp path):
+see [PRIVSEP.md](PRIVSEP.md). `--serve` is implemented as socketpair privsep in 0.2.0.
+Loopback only, and an API key is required.
 
 ## FreeBSD DTrace script
 
@@ -143,13 +145,13 @@ load → validate → attach probes → Register tools → unload drops tools
 - **`--hook-file`**: JSON HookScript (`llamaspy_hook`, `tools[]`, optional
   `bindings[]`, reserved `js_body`) **or** LLMS1 pipe file.
 - **`ToolRegistry`**: in-memory `Register` / `Unregister` / `List`; `--list-tools`.
-- **`--from-url`**: stub only — review-before-load; **no blind remote execute**.
+- **`--from-url`**: fetches a README and writes a draft; **no remote execute**.
 - **LLMS1** (`--gg-file`): supported simple dialect for offset bindings.
 - Delivery prior art: [phantom-kv](https://github.com/lordx64/phantom-kv)
   (loadable reversible grafts) — steal the *pipe*, not refusal-removal.
 - Read-only default; write/graft opt-in explicit. Own-process only.
-- JS/Lua body execution: **not embedded yet** (`js_body` stored, not run).
-- `ApplyReadOnly(pid)` still stubbed until mem backends land.
+- `js_body` runs in vendored Duktape.
+- `ApplyReadOnly(pid)` reads memory (symbol + displacement, build-id check). No writes.
 
 No memory writes in MVP. Linux memory engine (later) **must** use `PTRACE_O_TRACEEXIT` to avoid zombies.
 
@@ -180,4 +182,4 @@ See [PRIOR_ART.md](PRIOR_ART.md) — higkoo dashboard, llama.cpp `--metrics`, Vi
 2. **Spawn `dtrace` vs libdtrace** — scaffold spawns for debuggability; embedding is TODO on FreeBSD.
 3. **Wildcard `*llama_decode*`** — may over-match; tighten once we inventory symbols on real FreeBSD llama.cpp builds.
 4. **HTTP metric names** — parse current Prometheus names (`llamacpp:predicted_tokens_seconds`, etc.); label variants ignored for MVP.
-5. **Game Genie** — HookScripts mint tools; LLMS1 is the offset subset; JS engine + auto-POST deferred.
+5. **Game Genie** - HookScripts mint tools; LLMS1 is the offset subset; Duktape js_body runs in-process. Auto-POST is still later.
