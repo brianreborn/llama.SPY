@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -123,6 +124,7 @@ struct ElfLoad {
   uint64_t vaddr = 0;
   uint64_t offset = 0;
   uint64_t filesz = 0;
+  uint64_t memsz = 0;
 };
 
 struct ElfSym {
@@ -264,11 +266,13 @@ ElfView ParseElf(const FdReader& rd) {
     uint64_t offset = U64(p + 8, be);
     uint64_t vaddr = U64(p + 16, be);
     uint64_t filesz = U64(p + 32, be);
+    uint64_t memsz = U64(p + 40, be);
     if (type == kPtLoad) {
       ElfLoad ld;
       ld.vaddr = vaddr;
       ld.offset = offset;
       ld.filesz = filesz;
+      ld.memsz = memsz != 0 ? memsz : filesz;
       ev.loads.push_back(ld);
     } else if (type == kPtNote && filesz > 0 && filesz < (1u << 20)) {
       std::vector<uint8_t> note(static_cast<size_t>(filesz));
@@ -745,12 +749,55 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
   return out;
 }
 
+#if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+std::vector<MapRange> MapsFromSysctl(uint32_t pid, std::string* err) {
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, static_cast<int>(pid)};
+  size_t len = 0;
+  if (::sysctl(mib, 4, nullptr, &len, nullptr, 0) != 0 || len == 0) {
+    if (err) *err = std::string("KERN_PROC_VMMAP: ") + std::strerror(errno);
+    return {};
+  }
+  std::vector<unsigned char> buf(len + 128);
+  size_t cap = buf.size();
+  if (::sysctl(mib, 4, buf.data(), &cap, nullptr, 0) != 0) {
+    if (err) *err = std::string("KERN_PROC_VMMAP read: ") + std::strerror(errno);
+    return {};
+  }
+  len = cap;
+  std::vector<MapRange> out;
+  size_t off = 0;
+  while (off + sizeof(int) <= len) {
+    int sz = 0;
+    std::memcpy(&sz, buf.data() + off, sizeof(sz));
+    if (sz <= 0 || static_cast<size_t>(sz) < sizeof(int) || off + static_cast<size_t>(sz) > len) break;
+    if (static_cast<size_t>(sz) >= offsetof(kinfo_vmentry, kve_offset) + sizeof(uint64_t)) {
+      kinfo_vmentry kv {};
+      size_t copy = static_cast<size_t>(sz) < sizeof(kv) ? static_cast<size_t>(sz) : sizeof(kv);
+      std::memcpy(&kv, buf.data() + off, copy);
+      if (kv.kve_path[0] == '/' && kv.kve_end > kv.kve_start) {
+        MapRange r;
+        r.start = kv.kve_start;
+        r.end = kv.kve_end;
+        r.file_offset = kv.kve_offset;
+        r.has_file_offset = true;
+        r.path = kv.kve_path;
+        out.push_back(std::move(r));
+      }
+    }
+    off += static_cast<size_t>(sz);
+  }
+  return out;
+}
+#endif
+
 std::vector<MapRange> MapsForPid(uint32_t pid, int proc_dir, std::string* err) {
 #if defined(__linux__)
   auto m = MapsFromProc(pid, proc_dir, err);
   if (!m.empty()) return m;
 #else
   (void)proc_dir;
+  auto vm = MapsFromSysctl(pid, err);
+  if (!vm.empty()) return vm;
 #endif
   std::string procmap = "/proc/" + std::to_string(pid) + "/map";
   std::ifstream in(procmap);
@@ -1265,8 +1312,17 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     }
   }
   if (!in_map) {
+    std::ostringstream o;
+    o << "resolved address 0x" << std::hex << addr << "..0x" << addr_end
+      << " is outside the module mappings";
+    if (chosen) {
+      o << " path=" << chosen->path;
+      for (const auto& rg : chosen->ranges) {
+        o << " [0x" << rg.start << ",0x" << rg.end << ")";
+      }
+    }
     r.status = MemStatus::ReadError;
-    r.error = "resolved address is outside the module mappings";
+    r.error = o.str();
     return r;
   }
   r.address = addr;
