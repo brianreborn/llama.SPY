@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
+#include <signal.h>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -124,7 +125,7 @@ static void CheckFetch() {
   CHECK(!bad.ok);
   CHECK(Has(bad.error, "http"));
 
-  ::kill(child, SIGTERM);
+  kill(child, SIGTERM);
   int st = 0;
   ::waitpid(child, &st, 0);
 }
