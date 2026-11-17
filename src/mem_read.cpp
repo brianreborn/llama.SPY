@@ -1467,38 +1467,19 @@ bool FreebsdTextStamp(uint32_t pid, uint64_t* fileid, uint64_t* fsid, uint64_t* 
   char path[4096];
   size_t plen = sizeof(path);
   int pmib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, static_cast<int>(pid)};
-  if (::sysctl(pmib, 4, path, &plen, nullptr, 0) == 0 && path[0] == '/') {
-    auto maps = MapsFromSysctl(pid, nullptr);
-    std::string exe = NormalizeModulePath(path);
-    for (const auto& r : maps) {
-      if (NormalizeModulePath(r.path) != exe) continue;
-      if (*map_start == 0 || r.start < *map_start) *map_start = r.start;
-    }
+  if (::sysctl(pmib, 4, path, &plen, nullptr, 0) != 0 || path[0] != '/') return false;
+  struct stat st {};
+  if (::stat(path, &st) == 0) {
+    *fileid = static_cast<uint64_t>(st.st_ino);
+    *fsid = static_cast<uint64_t>(st.st_dev);
   }
-  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_FILEDESC, static_cast<int>(pid)};
-  size_t len = 0;
-  if (::sysctl(mib, 4, nullptr, &len, nullptr, 0) != 0 || len == 0) return *map_start != 0;
-  std::vector<unsigned char> buf(len + 128);
-  size_t cap = buf.size();
-  if (::sysctl(mib, 4, buf.data(), &cap, nullptr, 0) != 0) return *map_start != 0;
-  size_t off = 0;
-  while (off + sizeof(int) <= cap) {
-    int sz = 0;
-    std::memcpy(&sz, buf.data() + off, sizeof(sz));
-    if (sz <= 0 || off + static_cast<size_t>(sz) > cap) break;
-    if (static_cast<size_t>(sz) >= sizeof(int) * 4) {
-      kinfo_file kf {};
-      size_t copy = static_cast<size_t>(sz) < sizeof(kf) ? static_cast<size_t>(sz) : sizeof(kf);
-      std::memcpy(&kf, buf.data() + off, copy);
-      if (kf.kf_fd == KF_FD_TYPE_TEXT && kf.kf_type == KF_TYPE_VNODE) {
-        *fileid = kf.kf_file.kf_file_fileid;
-        *fsid = kf.kf_file.kf_file_fsid;
-        return true;
-      }
-    }
-    off += static_cast<size_t>(sz);
+  auto maps = MapsFromSysctl(pid, nullptr);
+  std::string exe = NormalizeModulePath(path);
+  for (const auto& r : maps) {
+    if (NormalizeModulePath(r.path) != exe) continue;
+    if (*map_start == 0 || r.start < *map_start) *map_start = r.start;
   }
-  return *map_start != 0 || *fileid != 0;
+  return *fileid != 0 || *map_start != 0;
 }
 #endif
 
