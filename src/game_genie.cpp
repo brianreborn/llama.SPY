@@ -272,24 +272,4 @@ std::string FormatCodebook(const GgCodebook& book) {
   return o.str();
 }
 
-GgApplyStatus ApplyReadOnly(uint32_t pid, const GgCodebook& book, std::string* detail_out) {
-  if (book.bindings.empty()) {
-    if (detail_out) *detail_out = "no bindings to apply";
-    return GgApplyStatus::Empty;
-  }
-  if (pid == 0) {
-    if (detail_out) *detail_out = "pid required for future mem read (got 0)";
-    return GgApplyStatus::InvalidArg;
-  }
-  std::ostringstream o;
-  o << "ApplyReadOnly not implemented yet (Linux process_vm_readv / FreeBSD later). "
-    << "Would read " << book.bindings.size() << " binding(s) from pid=" << pid << ":\n";
-  for (const auto& b : book.bindings) {
-    o << "  - " << b.symbol << " @ 0x" << std::hex << b.offset << std::dec
-      << " (" << GgValueTypeName(b.type) << ", " << b.width << " bytes)\n";
-  }
-  if (detail_out) *detail_out = o.str();
-  return GgApplyStatus::NotImplemented;
-}
-
 } // namespace llamaspy

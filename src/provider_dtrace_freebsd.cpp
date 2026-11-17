@@ -8,6 +8,7 @@
 // stub that returns AttachStatus::NotSupported so CMake still links.
 
 #include "llamaspy/telemetry_provider.hpp"
+#include "llamaspy/trace_parse.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -78,22 +79,16 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       // EOF or error — stop
       return false;
     }
-    if (line[0] == '#') {
-      // comment / banner from script
-      return true;
-    }
-    unsigned long long ts = 0, n = 0, avg = 0;
-    if (std::sscanf(line, "%llu %llu %llu", &ts, &n, &avg) != 3) {
-      return true;
-    }
+    TraceSample sample;
+    if (!ParseTraceSummaryLine(line, &sample)) return true;
     SnoopV1Frame f{};
     f.magic = kSnoopMagic;
     f.version = kSnoopVersion;
-    f.timestamp_ns = ts;
+    f.timestamp_ns = sample.timestamp_ns;
     f.pid = pid_;
-    f.decode_count = static_cast<uint32_t>(n);
-    f.decode_latency_ns_sum = static_cast<uint64_t>(avg) * n;
-    f.decode_latency_n = static_cast<uint32_t>(n);
+    f.decode_count = static_cast<uint32_t>(sample.decode_count);
+    f.decode_latency_ns_sum = sample.avg_latency_ns * sample.decode_count;
+    f.decode_latency_n = static_cast<uint32_t>(sample.decode_count);
     // Self-calculated tok/s left 0 here; TUI/collector may derive from deltas.
     cb(f);
     return true;
@@ -131,8 +126,10 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
 
   AttachStatus Attach(const AttachOptions&) override {
     // Primary path exists only on FreeBSD. Linux/macOS/Windows peers land later.
-    std::cerr << "[dtrace-freebsd] stub: not compiled on this OS "
-                 "(build on FreeBSD for pid provider + scripts/llama_decode.d)\n";
+    std::cerr << "[dtrace-freebsd] not supported on this OS. "
+                 "On Linux use --backend bpftrace (uprobe on llama_decode) or "
+                 "--backend http --metrics-url URL. "
+                 "Build on FreeBSD for the pid provider and scripts/llama_decode.d.\n";
     return AttachStatus::NotSupported;
   }
 

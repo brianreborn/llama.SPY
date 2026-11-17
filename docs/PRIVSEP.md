@@ -1,8 +1,10 @@
 # llama.SPY Privilege Separation (optional `--serve`)
 
-FreeBSD-first design for an optional metrics microservice. **MVP does not
-implement the split process yet** — this document freezes the sequence so the
-collector never binds the network and the web/TUI never holds DTrace credentials.
+FreeBSD-first design for an optional metrics microservice. **0.2.0 implements
+the socketpair split**: the collector never binds, and the serve child is the
+only process that listens. SHM is still not implemented. Capsicum (`cap_enter`)
+is used on FreeBSD; Linux uses a seccomp deny-list plus best-effort landlock
+on the serve child.
 
 ## Invariant
 
@@ -15,8 +17,10 @@ collector never binds the network and the web/TUI never holds DTrace credentials
 
 - Collector: attach backends only; push `SnoopV1Frame` over an inherited FD.
 - Serve: listen/accept/render only; receive frames; never opens `/dev/dtrace*`.
-- CLI sketch (future): `llamaspy --serve 127.0.0.1:9100 ...` forks after
-  `socketpair`, then each side drops privileges before doing its job.
+- CLI: `llamaspy --serve 127.0.0.1:9100 --api-key-file PATH ...` (default
+  `127.0.0.1:9100`). Every listener requires `--api-key` or `--api-key-file`.
+  Non-loopback addresses, including `0.0.0.0`, are refused even when a key
+  is set (LS1). A missing key is refused on loopback too.
 
 ## FreeBSD — Capsicum + socketpair (concrete sequence)
 
@@ -126,15 +130,17 @@ sandbox primitives:
 Yama/`kernel.yama.ptrace_scope` may already block late ptrace — treat that as
 orthogonal to landlock.
 
-## What MVP intentionally skips
+## What 0.2.0 still skips
 
-- No real Capsicum/`cap_enter` calls in the tree yet.
-- No `--serve` fork path (CLI returns “not implemented”; see `main.cpp`).
-  When implemented: LS1–LS4 above are blockers; full review board at
-  `/workspace/reviews/llama-spy-boundary-review.md`.
-- No SHM ring publish/consume yet (header + DESIGN sketch only; socketpair MVP).
-- No TLS termination in-process — put a reverse proxy in front later if needed.
+- SHM ring publish/consume (header + DESIGN sketch only; `--serve` is socketpair).
+- TLS termination in-process. Put a reverse proxy in front if you need TLS.
+- FreeBSD `cap_enter` is compiled in but was not executed on a FreeBSD host
+  in the 0.2.0 bring-up (Linux tests covered the socketpair, the API key, and
+  the loopback refusal).
+- The Linux sandbox is a syscall deny-list (collector: no bind/listen/accept;
+  serve: no connect/exec/ptrace/process_vm_*) plus landlock with no filesystem
+  rules. It is not a full allow-list seccomp policy.
 
-When implementing, keep the FreeBSD Capsicum path compiling behind
+Keep the FreeBSD Capsicum path compiling behind
 `#ifdef __FreeBSD__` and ship the Linux landlock/seccomp path as a peer
 `#ifdef __linux__` — do not invert the FreeBSD-first priority.

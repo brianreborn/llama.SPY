@@ -114,13 +114,24 @@ simple dialect. See [docs/GAME_GENIE.md](docs/GAME_GENIE.md).
 # LLMS1 simple dialect still works
 ./build/llamaspy --gg-file examples/codes.sample.gg
 
-# URL import is a stub (review-before-load later; no remote exec)
-./build/llamaspy --from-url https://example.com/hooks/slot-watch.json
+# Fetch a project README and write a draft HookScript. Nothing is executed.
+./build/llamaspy --from-url http://127.0.0.1:8000/README.md \
+  --draft-out /tmp/hook.draft.json
+```
+
+Privilege-separated metrics listener (collector never binds; loopback only;
+API key required; `0.0.0.0` is refused even with a key):
+
+```sh
+./build/llamaspy --serve 127.0.0.1:9100 --api-key-file /path/key \
+  --backend http --metrics-url http://127.0.0.1:8080/metrics --no-hud
 ```
 
 `js_body` runs in **vendored Duktape** (`third_party/duktape`, default
-`-DLLAMASPY_JS=ON`). Host API: `registerTool`, `log`, `readBinding` (metadata
-stub) — **no net, no fs**. Read-only default; own-process only. Delivery prior
+`-DLLAMASPY_JS=ON`). Host API: `registerTool`, `log`, `readBinding` (read-only
+memory: symbol + displacement, build-id checked). **No net, no fs**.
+Read-only default; own-process only. Generate real offsets with
+`scripts/gen-gg-offsets.sh`. Delivery prior
 art: [phantom-kv](https://github.com/lordx64/phantom-kv) (loadable reversible
 grafts) — observability tooling only, not refusal-removal.
 
@@ -133,7 +144,7 @@ CLI help + HUD labels via `T("key")`. Auto-pick: `LLAMASPY_LANG` → `LANG` /
 
 ## Diagrams
 
-Mermaid diagrams of `main` (`a0f4916`, v0.1.0-test2), rendered by GitHub. The text privsep diagram in [docs/PRIVSEP.md](docs/PRIVSEP.md) and the SnoopV1 / ring tables in [docs/DESIGN.md](docs/DESIGN.md) stay as they are. Dashed parts are designed, not implemented.
+Mermaid diagrams below are rendered by GitHub. The component path matches 0.2.0 (`--serve` is a real socketpair split). The SHM sequence later in this file is still design-only. The text privsep diagram in [docs/PRIVSEP.md](docs/PRIVSEP.md) and the SnoopV1 / ring tables in [docs/DESIGN.md](docs/DESIGN.md) stay as the layout reference.
 
 ### Components and data path
 
@@ -150,7 +161,7 @@ flowchart LR
   hud["HUD / summary output<br/>i18n en, ja"]
   gg["Game Genie<br/>HookScripts -> ToolRegistry<br/>Duktape js_body"]
   stdout["stdout"]
-  serve["--serve (stub, exits 2;<br/>designed: dropped privileges, HTTP / TUI)"]
+  serve["--serve 127.0.0.1:9100<br/>unprivileged HTTP, API key required"]
 
   target -->|FreeBSD, --pid| dtrace
   target -->|Linux, --pid| bpf
@@ -162,12 +173,10 @@ flowchart LR
   http --> frame
   frame --> hud
   gg -->|--list-tools, --call-tool| stdout
-  frame -.->|"designed: socketpair, later SHM ring"| serve
-  classDef planned stroke-dasharray: 4 3
-  class serve planned
+  frame -->|"socketpair, snoop_hton"| serve
 ```
 
-`auto` picks DTrace on FreeBSD and bpftrace on Linux when `--pid` is given; otherwise it needs `--metrics-url` or `--log-file`. On other systems `auto --pid` errors (no live-attach backend). `uprobe` is an alias for `bpftrace`. `--serve` is drawn dashed because it is a stub that exits 2.
+`auto` picks DTrace on FreeBSD and bpftrace on Linux when `--pid` is given; otherwise it needs `--metrics-url` or `--log-file`. On other systems `auto --pid` errors (no live-attach backend). `uprobe` is an alias for `bpftrace`. If live attach fails and `--metrics-url` is set, `auto` falls back to HTTP. `--serve` forks a collector (no listen socket) and a loopback server. The SHM ring is still only a design.
 
 ### Provider lifecycle
 
@@ -217,7 +226,7 @@ sequenceDiagram
   Note over C,S: generation bump on collector restart poisons stale consumers.<br/>Designed MVP for --serve: socketpair, hton / ntoh only at that boundary.
 ```
 
-### Privilege separation (designed for `--serve`)
+### Privilege separation (`--serve`)
 
 ```mermaid
 flowchart TB
@@ -282,12 +291,13 @@ flowchart LR
 
 ```
 include/llamaspy/   snoop_v1, telemetry_provider, metrics_http, tui_stub, game_genie,
-                   hook_script, tool_registry, js_engine, i18n
-src/                main, metrics_http, provider_dtrace_freebsd, tui_stub, game_genie,
-                   hook_script, tool_registry, js_engine, log_timings, i18n
+                   hook_script, tool_registry, js_engine, i18n, mem_read, serve, from_url
+src/                main, metrics_http, provider_dtrace_freebsd, provider_bpftrace_linux,
+                   tui_stub, game_genie, hook_script, tool_registry, js_engine,
+                   log_timings, i18n, mem_read, serve, from_url, trace_parse
 third_party/        duktape/ (vendored amalgamation for js_body)
-scripts/            llama_decode.d
-examples/           hook.sample.json, codes.sample.gg
+scripts/            llama_decode.d, llama_decode.bt, gen-gg-offsets.sh
+examples/           hook.sample.json, codes.sample.gg (templates; regenerate offsets)
 locales/            en.json, ja.json
 docs/               DESIGN, PRIOR_ART, PRIVSEP, GAME_GENIE, METRICS_MAP
 ```
@@ -303,7 +313,7 @@ Repo directory: `/workspace/llama.SPY`.
 
 ## Status
 
-Scaffold: builds on Linux (HTTP + HUD + HookScript/ToolRegistry + Duktape `js_body` + i18n en/ja), FreeBSD DTrace behind `#if defined(LLAMASPY_FREEBSD) || defined(__FreeBSD__)`. No memory writes. `--serve` documented, not implemented. FreeBSD live testing deferred until first-test e2e. Fullscreen TUI later.
+Version 0.2.0. Builds on Linux (HTTP, bpftrace uprobes, HUD, HookScript, Duktape, read-only mem backend, `--serve`, `--from-url`) and on FreeBSD (DTrace provider, same mem/serve/from-url code paths). No memory writes. `--serve` is socketpair privsep, loopback only, API key required. SHM ring and fullscreen TUI are still later. Live FreeBSD DTrace against llama-server was not run in this change.
 
 ## Localization
 

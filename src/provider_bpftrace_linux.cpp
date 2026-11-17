@@ -3,6 +3,7 @@
 // parses the same "ts n avg" lines into SnoopV1 frames. Read-only; no ptrace.
 // Requires root or CAP_BPF+CAP_PERFMON. Non-Linux builds get a stub.
 #include "llamaspy/telemetry_provider.hpp"
+#include "llamaspy/trace_parse.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +46,11 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
   const char* name() const override { return "bpftrace-linux"; }
   AttachStatus Attach(const AttachOptions& opts) override {
     if (opts.pid == 0) return AttachStatus::Failed;
+    if (!BpftraceOnPath()) {
+      std::cerr << "[bpftrace-linux] bpftrace not installed; live uprobes unavailable "
+                   "(install bpftrace, or use --backend http)\n";
+      return AttachStatus::NotSupported;
+    }
     pid_ = opts.pid;
     std::string tmpl = opts.dtrace_script_path;
     auto dot = tmpl.rfind(".d");
@@ -92,14 +98,14 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
       }
       return false;
     }
-    if (line[0] == '#' || line[0] == '\n') return true;
-    unsigned long long ts = 0, n = 0, avg = 0;
-    if (std::sscanf(line, "%llu %llu %llu", &ts, &n, &avg) != 3) return true;
+    TraceSample sample;
+    if (!ParseTraceSummaryLine(line, &sample)) return true;
     SnoopV1Frame f{};
-    f.magic = kSnoopMagic; f.version = kSnoopVersion; f.timestamp_ns = ts; f.pid = pid_;
-    f.decode_count = static_cast<uint32_t>(n);
-    f.decode_latency_ns_sum = static_cast<uint64_t>(avg) * n;
-    f.decode_latency_n = static_cast<uint32_t>(n);
+    f.magic = kSnoopMagic; f.version = kSnoopVersion;
+    f.timestamp_ns = sample.timestamp_ns; f.pid = pid_;
+    f.decode_count = static_cast<uint32_t>(sample.decode_count);
+    f.decode_latency_ns_sum = sample.avg_latency_ns * sample.decode_count;
+    f.decode_latency_n = static_cast<uint32_t>(sample.decode_count);
     cb(f);
     return true;
   }
@@ -118,7 +124,8 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
  public:
   const char* name() const override { return "bpftrace-linux"; }
   AttachStatus Attach(const AttachOptions&) override {
-    std::cerr << "[bpftrace-linux] stub: Linux only (use --backend dtrace on FreeBSD)\n";
+    std::cerr << "[bpftrace-linux] not supported on this OS "
+                 "(FreeBSD uses --backend dtrace; elsewhere use --backend http)\n";
     return AttachStatus::NotSupported;
   }
   bool StreamMetrics(MetricsCallback) override { return false; }

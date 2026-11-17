@@ -71,10 +71,15 @@ Linux live attach: `sudo ./bin/llamaspy --backend auto --pid PID` (needs bpftrac
 Dynamically linked against glibc + libstdc++ (typical Ubuntu/Debian amd64).
 No system Duktape package required (vendored at build time).
 
-## Known stubs in this test build
+## This prebuilt bundle (0.1.0-test2)
+
+The downloadable test2 tarball predates source version 0.2.0. In that bundle
+the following were still stubs:
 
 - Mem backend for Game Genie bindings (metadata only)
 - `--serve` privsep collector
 - `--from-url` remote draft (no remote exec)
+
+Source 0.2.0 implements them. Rebuild from the tag or main to get the new binary.
 
 See `STATUS.txt` in the source repo and `docs/` for design notes.

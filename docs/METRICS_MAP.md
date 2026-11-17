@@ -43,3 +43,11 @@ Stub only: re-reads the file each poll. No FD hijack / stderr steal yet.
 | duration sum / n | `decode_latency_ns_sum` / `decode_latency_n` |
 
 Tok/s left 0 for the HUD/collector to derive from deltas when desired.
+
+## `--serve` re-export
+
+The serve child turns the latest admitted `SnoopV1Frame` back into Prometheus
+text (`llamacpp:predicted_tokens_seconds`, `llamacpp:prompt_tokens_seconds`,
+`llamacpp:requests_processing`, `llamacpp:requests_deferred`,
+`llamacpp:n_decode_total`, plus `llamaspy:decode_latency_ns_avg`). `GET /metrics`
+and `GET /health` both require the listener API key.

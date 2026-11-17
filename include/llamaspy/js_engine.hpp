@@ -1,6 +1,6 @@
 #pragma once
 // Minimal Duktape-backed JS engine for HookScript js_body.
-// Host API (no net, no fs): registerTool, log, readBinding (stub).
+// Host API (no net, no fs): registerTool, log, readBinding (read-only mem).
 // See docs/GAME_GENIE.md and third_party/duktape/README.md.
 
 #include "llamaspy/game_genie.hpp"
@@ -21,7 +21,7 @@ class JsEngine {
   bool available() const;
   void Shutdown();
 
-  // Bind codebook for readBinding(sym) lookups (metadata only; no mem read).
+  // Bind codebook for readBinding(sym). Reads when SetMemTargetPid is set.
   void SetBindings(const GgCodebook* book);
 
   // Eval hook.js_body; registerTool() calls may mint tools into ToolRegistry.
@@ -43,7 +43,7 @@ class JsEngine {
 
 // Dispatch ToolRegistry handler tags:
 //   js:<name>            → JsEngine::CallJsTool
-//   read_binding:<sym>   → stub JSON (no mem backend yet)
+//   read_binding:<sym>   -> read-only JSON (needs --pid; never writes)
 //   other                → error JSON
 // Returns process exit-style: true if tool found and handler ran (even if stub).
 bool CallTool(std::string_view name, std::string_view json_args,

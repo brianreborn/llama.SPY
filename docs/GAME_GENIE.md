@@ -52,7 +52,7 @@ default). Manifest `tools[]` register immediately; `js_body` may call
 {
   "llamaspy_hook": 1,
   "name": "slot-watch",
-  "note": "example — fake offsets",
+  "note": "example - regenerate offsets with scripts/gen-gg-offsets.sh",
   "readonly": true,
   "tools": [
     {
@@ -63,7 +63,7 @@ default). Manifest `tools[]` register immediately; `js_body` may call
     }
   ],
   "bindings": [
-    "LLMS1|sym=n_past|off=0xdead0000|width=8|type=u64|fp=llama.cpp@fake|note=kv cursor"
+    "LLMS1|sym=n_past|off=0x0|width=8|type=u64|fp=buildid:REPLACE_ME|note=TEMPLATE symbol+0"
   ],
   "js_body": "registerTool({name:\"echo\", description:\"demo\", schema:{}, handler:function(a){return a;}});\n"
 }
@@ -105,8 +105,8 @@ codebook and registers nothing (same as a pure LLMS1 file).
 # LLMS1-only alias (unchanged)
 ./build/llamaspy --gg-file examples/codes.sample.gg
 
-# URL import stub — never fetches/executes remotely in this scaffold
-./build/llamaspy --from-url https://example.com/hooks/slot-watch.json
+# Fetch a README (or a JSON hook) and write a draft. Never executed.
+./build/llamaspy --from-url http://127.0.0.1:8000/README.md --draft-out hook.draft.json
 ```
 
 ### `js_body` host API (MVP)
@@ -117,7 +117,7 @@ Injected globals — **no network, no filesystem, no `require`**:
 |-----|----------|
 | `registerTool({name, description?, schema?, handler})` | `handler` must be a JS function; registers into `ToolRegistry` with tag `js:<name>` |
 | `log(...)` | writes a single line to stderr |
-| `readBinding(sym)` | returns binding **metadata** from the HookScript codebook, or `null`; `value` is always null until a mem backend exists |
+| `readBinding(sym)` | read-only value for a codebook binding when `--pid` is set; otherwise an error. Never writes. |
 
 Build flag: `-DLLAMASPY_JS=ON` (default when `third_party/duktape/` is present).
 `-DLLAMASPY_JS=OFF` keeps the binary green without executing `js_body`.
@@ -125,9 +125,10 @@ Build flag: `-DLLAMASPY_JS=ON` (default when `third_party/duktape/` is present).
 `--hook-file -` reads stdin. Detection: leading `{` → JSON HookScript;
 otherwise → LLMS1 pipe dialect.
 
-`--from-url` prints a stub message (`not implemented: will draft HookScripts
-from project README`) and exits non-zero. Future: fetch → **show for
-review** → require explicit confirm before load. **No blind remote execute.**
+`--from-url` fetches the URL (http, or https via `curl`/`fetch`) and writes a
+draft JSON file. It does not load the draft and does not run remote code.
+`js_body` in the draft is always empty. `readonly` is forced true. Review the
+file, then pass it to `--hook-file` yourself.
 
 ## Simple dialect: LLMS1 pipe codes
 
@@ -142,7 +143,7 @@ LLMS1|sym=<name>|off=<hex-or-dec>|width=<bytes>|type=<ty>|fp=<fingerprint>|note=
 |-------|----------|---------|
 | magic | yes | Literal `LLMS1` |
 | `sym=` | yes | Logical name |
-| `off=` | yes | Byte offset (`0x…` or decimal). Aliases: `offset=`, `addr=` |
+| `off=` | yes | Displacement added to the symbol (`0x0` reads the symbol). Aliases: `offset=`, `addr=` |
 | `type=` | yes\* | `u8` `u16` `u32` `u64` `i32` `i64` `f32` `f64` |
 | `width=` | yes\* | Byte width; omit → derive from type. Cap 64 |
 | `fp=` / `build=` | no | Build fingerprint |
@@ -151,7 +152,34 @@ LLMS1|sym=<name>|off=<hex-or-dec>|width=<bytes>|type=<ty>|fp=<fingerprint>|note=
 \* At least one of `type=` or `width=`. Blank / `#` lines are comments.
 Unknown `key=` ignored (forward-compatible).
 
-Sample: `examples/codes.sample.gg`.
+Sample: `examples/codes.sample.gg` (templates, not live offsets).
+
+## Address model (read-only)
+
+```
+addr = load_bias + symbol_st_value + off
+```
+
+`off` is a displacement. `off=0x0` reads the symbol itself. `load_bias` comes
+from `/proc/PID/maps` (Linux) or `procstat -v` (FreeBSD): the mapping start of
+the ELF LOAD segment minus that segment's `p_vaddr`.
+
+`fp=buildid:<hex>` is the GNU build-id. A binding that carries `fp` and does
+not match the mapped module is refused. An empty `fp` is allowed and warned.
+
+```sh
+scripts/gen-gg-offsets.sh /path/to/llama-server llama_decode
+```
+
+The script uses `nm`/`readelf` (or the llvm tools). It prints `off=0x0` plus
+the symbol VA in a comment. Paste the `LLMS1` line into a `.gg` file or a
+HookScript `bindings` array. Fix `width` and `type` for the real object.
+
+Linux reads use `process_vm_readv`, then `/proc/PID/mem`. FreeBSD tries
+`/proc/PID/mem` and otherwise `ptrace(PT_IO, PIOD_READ_D)`, which briefly
+stops the target, then detaches. Permission failures name `ptrace_scope`
+(Linux) or same-uid / `security.bsd.unprivileged_proc_debug` (FreeBSD).
+There is no write path.
 
 ## Mapping to TelemetryProvider + ToolRegistry
 
@@ -195,10 +223,10 @@ unattended RCE, not shipping hostile grafts.
 | HookScript JSON load + tool Register | **Implemented** |
 | `ToolRegistry` in-memory + `--list-tools` | **Implemented** |
 | `--hook-file` (JSON or LLMS1) | **Implemented** |
-| `--call-tool` / `--invoke` | **Implemented** (JS + read_binding stub) |
+| `--call-tool` / `--invoke` | **Implemented** (JS + read-only `read_binding`) |
 | `--gg-file` LLMS1 dump | **Implemented** (kept) |
-| `--from-url` | **Stub** (message only) |
-| `ApplyReadOnly(pid)` for bindings | **Stub** |
+| `--from-url` | **Implemented** (draft file only; no remote exec) |
+| `ApplyReadOnly(pid)` for bindings | **Implemented** (read-only; fingerprint checked) |
 | `js_body` via Duktape | **Implemented** (vendored; `LLAMASPY_JS`) |
 | Write / graft handlers | **Opt-in later**; off by default |
 | FreeBSD live dogfood | Deferred until first-test e2e (operator) |

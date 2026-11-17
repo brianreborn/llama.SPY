@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 # Official product name: llama.SPY (filesystem-safe target/binary: llamaspy)
-project(llama_SPY VERSION 0.1.0 LANGUAGES C CXX)
+project(llama_SPY VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,10 @@ set(LLAMASPY_SOURCES
   src/tool_registry.cpp
   src/hook_script.cpp
   src/js_engine.cpp
+  src/mem_read.cpp
+  src/serve.cpp
+  src/from_url.cpp
+  src/trace_parse.cpp
 )
 
 add_executable(llamaspy ${LLAMASPY_SOURCES})
@@ -84,4 +88,41 @@ install(FILES ${LLAMASPY_LOCALES} DESTINATION share/llamaspy/locales)
 install(FILES docs/DESIGN.md docs/PRIOR_ART.md docs/PRIVSEP.md docs/GAME_GENIE.md docs/METRICS_MAP.md README.md DESTINATION share/doc/llamaspy)
 install(FILES examples/codes.sample.gg examples/hook.sample.json DESTINATION share/llamaspy/examples)
 
-message(STATUS "llama.SPY ${PROJECT_VERSION} — FreeBSD-first scaffold (binary: llamaspy)")
+message(STATUS "llama.SPY ${PROJECT_VERSION} - FreeBSD-first (binary: llamaspy)")
+
+enable_testing()
+find_package(Threads REQUIRED)
+
+add_executable(test_mem_read tests/test_mem_read.cpp src/mem_read.cpp src/game_genie.cpp)
+target_include_directories(test_mem_read PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(test_mem_read PRIVATE LLAMASPY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+  target_compile_definitions(test_mem_read PRIVATE LLAMASPY_FREEBSD=1)
+endif()
+
+add_executable(test_serve tests/test_serve.cpp src/serve.cpp)
+target_include_directories(test_serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+  target_compile_definitions(test_serve PRIVATE LLAMASPY_FREEBSD=1)
+endif()
+
+add_executable(test_from_url tests/test_from_url.cpp src/from_url.cpp src/hook_script.cpp
+               src/game_genie.cpp src/tool_registry.cpp)
+target_include_directories(test_from_url PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_from_url PRIVATE Threads::Threads)
+
+add_executable(test_trace_parse tests/test_trace_parse.cpp src/trace_parse.cpp)
+target_include_directories(test_trace_parse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(test_trace_parse PRIVATE LLAMASPY_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+add_test(NAME mem_read COMMAND test_mem_read)
+add_test(NAME serve_policy COMMAND test_serve)
+add_test(NAME from_url COMMAND test_from_url)
+add_test(NAME trace_parse COMMAND test_trace_parse)
+add_test(NAME cli_serve COMMAND sh ${CMAKE_SOURCE_DIR}/tests/cli_serve_test.sh $<TARGET_FILE:llamaspy>)
+add_test(NAME no_target_writes COMMAND sh ${CMAKE_SOURCE_DIR}/tests/no_target_writes.sh ${CMAKE_SOURCE_DIR})
+add_test(NAME hook_smoke COMMAND sh ${CMAKE_SOURCE_DIR}/bin/run-hook-smoke.sh)
+add_test(NAME gen_gg_offsets COMMAND sh ${CMAKE_SOURCE_DIR}/tests/gen_gg_offsets_test.sh
+         $<TARGET_FILE:test_mem_read> ${CMAKE_SOURCE_DIR}/scripts/gen-gg-offsets.sh)
+set_tests_properties(mem_read serve_policy from_url trace_parse cli_serve no_target_writes hook_smoke gen_gg_offsets
+                     PROPERTIES TIMEOUT 60)

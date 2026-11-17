@@ -15,6 +15,7 @@ CMakeFiles/
 # Local / HUD / smoke dumps
 LIVE.txt
 SMOKE.txt
+llamaspy-hook.draft.json
 dist/
 dist-staging/
 .cache/
