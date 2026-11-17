@@ -17,15 +17,15 @@ printf '%s\n' 'eval time = 1.00 ms / 10 runs (12.50 tokens per second)' > "$TMP/
 printf '%s\n' 'secret-key' > "$TMP/key"
 chmod 600 "$TMP/key"
 
-"$BIN" --serve 127.0.0.1:0 --api-key-file "$TMP/key" --backend log \
+"$BIN" --serve 127.0.0.1:0 --listen-api-key-file "$TMP/key" --backend log \
   --log-file "$TMP/t.log" --no-hud >"$TMP/out" 2>&1 &
 PID=$!
 
 PORT=""
 i=0
 while [ "$i" -lt 50 ]; do
-  if grep -q 'listening on 127.0.0.1:' "$TMP/out" 2>/dev/null; then
-    PORT=$(sed -n 's/.*listening on 127.0.0.1:\([0-9][0-9]*\).*/\1/p' "$TMP/out" | head -n 1)
+  PORT=$(sed -n 's/.*127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$TMP/out" | head -n 1)
+  if [ -n "$PORT" ]; then
     break
   fi
   if ! kill -0 "$PID" 2>/dev/null; then
@@ -82,7 +82,7 @@ print("cli serve ok")
 PY
 
 # Policy rejects. These must fail before bind.
-if "$BIN" --serve 0.0.0.0:9100 --api-key secret-key --backend log \
+if "$BIN" --serve 0.0.0.0:9100 --listen-api-key secret-key --backend log \
      --log-file "$TMP/t.log" --no-hud >"$TMP/rej" 2>&1; then
   echo "0.0.0.0 with a key should be refused" >&2
   exit 1

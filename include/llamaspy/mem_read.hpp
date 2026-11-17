@@ -68,10 +68,25 @@ bool FingerprintAccepts(const std::string& module_build_id_hex, const std::strin
 std::vector<MapRange> ParseLinuxMapsText(std::string_view text);
 std::vector<MapRange> ParseProcstatVText(std::string_view text);
 
+// Identity of a process at one moment. pidfd (Linux) plus start time.
+// A reused pid does not keep the same pidfd or the same start time.
+struct ProcIdentity {
+  uint32_t pid = 0;
+  bool alive = false;
+  uint64_t start_a = 0;
+  uint64_t start_b = 0;
+  int pidfd = -1;
+};
+
+ProcIdentity CaptureProcIdentity(uint32_t pid);
+void ReleaseProcIdentity(ProcIdentity* id);
+bool ProcIdentityStill(const ProcIdentity& id);
+
 // Read exactly n bytes. On failure buf is untouched and *err explains why.
 // Permission errors name ptrace_scope / same-uid. This function never writes.
-bool ReadProcessBytes(uint32_t pid, uint64_t addr, void* buf, size_t n,
-                      std::string* err, MemBackend backend = MemBackend::Auto);
+// proc_dir, when >= 0, is a directory fd for /proc/PID (Linux) used for mem.
+bool ReadProcessBytes(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err,
+                      MemBackend backend = MemBackend::Auto, int proc_dir = -1);
 
 BindingRead ReadBinding(uint32_t pid, const GgBinding& binding,
                         MemBackend backend = MemBackend::Auto);

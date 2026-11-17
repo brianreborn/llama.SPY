@@ -131,6 +131,7 @@ int main() {
     CHECK(rd.hex.size() == 16);
   }
 
+#if defined(__linux__)
   auto via_vm = llamaspy::ReadBinding(static_cast<uint32_t>(child), u64,
                                      llamaspy::MemBackend::ProcessVmReadv);
   CHECK(via_vm.status == llamaspy::MemStatus::Ok);
@@ -151,6 +152,19 @@ int main() {
   } else {
     CHECK(via_proc.raw_bits == kChildU64);
   }
+#else
+  auto via_vm = llamaspy::ReadBinding(static_cast<uint32_t>(child), u64,
+                                     llamaspy::MemBackend::ProcessVmReadv);
+  CHECK(via_vm.status == llamaspy::MemStatus::Unsupported);
+  auto via_ptr = llamaspy::ReadBinding(static_cast<uint32_t>(child), u64,
+                                      llamaspy::MemBackend::PtraceIo);
+  if (via_ptr.status != llamaspy::MemStatus::Ok) {
+    std::cerr << "ptrace read failed: " << via_ptr.error << "\n";
+    ++g_fail;
+  } else {
+    CHECK(via_ptr.raw_bits == kChildU64);
+  }
+#endif
 
   auto u32 = Binding("llamaspy_test_u32", 0, llamaspy::GgValueType::U32, fp);
   auto rd32 = llamaspy::ReadBinding(static_cast<uint32_t>(child), u32);
@@ -201,8 +215,13 @@ int main() {
     CHECK(js.find("1122334455667788") != std::string::npos);
   }
 
+  auto ident = llamaspy::CaptureProcIdentity(static_cast<uint32_t>(child));
+  CHECK(ident.alive);
+  CHECK(llamaspy::ProcIdentityStill(ident));
   ::kill(child, SIGKILL);
   ::waitpid(child, nullptr, 0);
+  CHECK(!llamaspy::ProcIdentityStill(ident));
+  llamaspy::ReleaseProcIdentity(&ident);
 
   if (g_fail) {
     std::cerr << g_fail << " failure(s)\n";

@@ -1,6 +1,10 @@
 #include "llamaspy/serve.hpp"
 
+#include "llamaspy/proc_util.hpp"
 #include "llamaspy/snoop_v1.hpp"
+
+#include <atomic>
+#include <ctime>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -11,6 +15,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <grp.h>
@@ -73,12 +78,33 @@ bool ConstTimeEqual(const std::string& a, const std::string& b) {
 }
 
 void ScrubFds(int keep) {
+#if defined(__linux__) && defined(SYS_close_range)
+  unsigned int first = 3;
+  unsigned int last_before = keep > 3 ? static_cast<unsigned int>(keep - 1) : 2;
+  if (keep > 3) {
+    if (::syscall(SYS_close_range, first, last_before, 0u) != 0) {
+      for (int fd = 3; fd < keep; ++fd) ::close(fd);
+    }
+  } else {
+    for (int fd = 3; fd < keep; ++fd) ::close(fd);
+  }
+  if (keep >= 0 &&
+      ::syscall(SYS_close_range, static_cast<unsigned int>(keep + 1), ~0u, 0u) != 0) {
+    long max = ::sysconf(_SC_OPEN_MAX);
+    if (max < 0 || max > 4096) max = 4096;
+    for (int fd = keep + 1; fd < static_cast<int>(max); ++fd) ::close(fd);
+  }
+#elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+  if (keep >= 0) ::closefrom(keep + 1);
+  for (int fd = 3; fd < keep; ++fd) ::close(fd);
+#else
   long max = ::sysconf(_SC_OPEN_MAX);
   if (max < 0 || max > 4096) max = 4096;
   for (int fd = 3; fd < static_cast<int>(max); ++fd) {
     if (fd == keep) continue;
     ::close(fd);
   }
+#endif
 }
 
 #if defined(__linux__)
@@ -91,7 +117,7 @@ sock_filter Sf(uint16_t code, uint8_t jt, uint8_t jf, uint32_t k) {
   return s;
 }
 
-void InstallSeccompDeny(const int* nrs, size_t count) {
+bool InstallSeccompDeny(const int* nrs, size_t count) {
 #  if defined(__x86_64__)
   const uint32_t arch = AUDIT_ARCH_X86_64;
 #  elif defined(__aarch64__)
@@ -99,14 +125,19 @@ void InstallSeccompDeny(const int* nrs, size_t count) {
 #  elif defined(__i386__)
   const uint32_t arch = AUDIT_ARCH_I386;
 #  else
-  std::cerr << "llama.SPY: seccomp skipped on this architecture\n";
-  return;
+  std::cerr << "llama.SPY: seccomp refused on this architecture\n";
+  return false;
 #  endif
   std::vector<sock_filter> prog;
   prog.push_back(Sf(BPF_LD | BPF_W | BPF_ABS,
                     0, 0, static_cast<uint32_t>(offsetof(struct seccomp_data, arch))));
   prog.push_back(Sf(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, arch));
-  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW));
+  // Foreign ABIs are not a bypass. Kill rather than allow.
+#  ifdef SECCOMP_RET_KILL_PROCESS
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS));
+#  else
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL));
+#  endif
   prog.push_back(Sf(BPF_LD | BPF_W | BPF_ABS,
                     0, 0, static_cast<uint32_t>(offsetof(struct seccomp_data, nr))));
   for (size_t i = 0; i < count; ++i) {
@@ -117,18 +148,20 @@ void InstallSeccompDeny(const int* nrs, size_t count) {
   prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW));
   if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
     std::cerr << "llama.SPY: PR_SET_NO_NEW_PRIVS failed: " << std::strerror(errno) << "\n";
-    return;
+    return false;
   }
   sock_fprog fp{};
   fp.len = static_cast<unsigned short>(prog.size());
   fp.filter = prog.data();
   if (::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fp) != 0) {
     std::cerr << "llama.SPY: seccomp install failed: " << std::strerror(errno) << "\n";
+    return false;
   }
+  return true;
 }
 
-void DenyBindFamily(bool strict) {
-  int nrs[12];
+bool DenyBindFamily(bool strict) {
+  int nrs[16];
   size_t n = 0;
   nrs[n++] = SYS_bind;
   nrs[n++] = SYS_listen;
@@ -136,24 +169,24 @@ void DenyBindFamily(bool strict) {
 #  ifdef SYS_accept4
   nrs[n++] = SYS_accept4;
 #  endif
+  nrs[n++] = SYS_execve;
+#  ifdef SYS_execveat
+  nrs[n++] = SYS_execveat;
+#  endif
+#  ifdef SYS_ptrace
+  nrs[n++] = SYS_ptrace;
+#  endif
+#  ifdef SYS_process_vm_writev
+  nrs[n++] = SYS_process_vm_writev;
+#  endif
   if (strict) {
     nrs[n++] = SYS_connect;
 #  ifdef SYS_open
     nrs[n++] = SYS_open;
 #  endif
     nrs[n++] = SYS_openat;
-    nrs[n++] = SYS_execve;
-#  ifdef SYS_execveat
-    nrs[n++] = SYS_execveat;
-#  endif
-#  ifdef SYS_ptrace
-    nrs[n++] = SYS_ptrace;
-#  endif
-#  ifdef SYS_process_vm_writev
-    nrs[n++] = SYS_process_vm_writev;
-#  endif
   }
-  InstallSeccompDeny(nrs, n);
+  return InstallSeccompDeny(nrs, n);
 }
 
 void TryLandlock() {
@@ -192,7 +225,7 @@ void TryLandlock() {
 #  endif
 }
 
-void DenyServeSyscalls() {
+bool DenyServeSyscalls() {
   int nrs[12];
   size_t n = 0;
   nrs[n++] = SYS_bind;
@@ -211,7 +244,7 @@ void DenyServeSyscalls() {
 #  ifdef SYS_process_vm_writev
   nrs[n++] = SYS_process_vm_writev;
 #  endif
-  InstallSeccompDeny(nrs, n);
+  return InstallSeccompDeny(nrs, n);
 }
 #endif  // __linux__
 
@@ -349,8 +382,13 @@ void PrintBound(int fd) {
   } else {
     return;
   }
-  std::cerr << "llama.SPY serve listening on " << host << ":" << port
-            << " (API key required)\n";
+  char msg[192];
+  int nw = std::snprintf(msg, sizeof(msg),
+                         "llama.SPY serve listening on %s:%d (API key required)\n", host, port);
+  if (nw > 0) {
+    ssize_t wr = ::write(STDERR_FILENO, msg, static_cast<size_t>(nw));
+    (void)wr;
+  }
 }
 
 std::string HeaderValue(const std::string& req, const std::string& name) {
@@ -427,13 +465,37 @@ std::string MetricsText(const SnoopV1Frame* frame) {
   return o.str();
 }
 
+bool HostIsLoopback(const std::string& value) {
+  std::string h = Trim(value);
+  if (h.empty()) return false;
+  if (h.front() == '[') {
+    auto rb = h.find(']');
+    if (rb == std::string::npos) return false;
+    h = h.substr(1, rb - 1);
+  } else {
+    auto colon = h.rfind(':');
+    if (colon != std::string::npos) h = h.substr(0, colon);
+  }
+  h = Lower(h);
+  return h == "127.0.0.1" || h == "localhost" || h == "::1";
+}
+
+long MonoMs() {
+  timespec ts{};
+  ::clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 void HandleClient(int fd, const std::string& key, const SnoopV1Frame* frame) {
+  const long deadline = MonoMs() + 2000;
   timeval tv{};
   tv.tv_sec = 2;
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   std::string raw;
   char buf[1024];
   while (raw.size() < 8192 && raw.find("\r\n\r\n") == std::string::npos) {
+    if (MonoMs() > deadline) break;
     ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n < 0) {
       if (errno == EINTR) continue;
@@ -444,6 +506,11 @@ void HandleClient(int fd, const std::string& key, const SnoopV1Frame* frame) {
   }
   if (raw.find("\r\n\r\n") == std::string::npos) {
     SendResponse(fd, 400, "Bad Request", "bad request\n", "text/plain", false);
+    return;
+  }
+  std::string host = HeaderValue(raw, "host");
+  if (!HostIsLoopback(host)) {
+    SendResponse(fd, 400, "Bad Request", "host not loopback\n", "text/plain", false);
     return;
   }
   if (!Authorized(raw, key)) {
@@ -490,7 +557,7 @@ int ServeChild(int ipc, const ServeConfig& cfg) {
   DropToNobody();
 #if defined(__linux__)
   TryLandlock();
-  DenyServeSyscalls();
+  if (!DenyServeSyscalls()) _exit(1);
 #endif
 #if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
   CapsicumServe(ipc, lfd);
@@ -556,14 +623,27 @@ int ServeChild(int ipc, const ServeConfig& cfg) {
   return 0;
 }
 
-pid_t g_coll = -1;
-pid_t g_serve_pid = -1;
+std::atomic<int> g_coll{-1};
+std::atomic<int> g_serve_pid{-1};
 volatile sig_atomic_t g_stop = 0;
 
 void OnStop(int) {
   g_stop = 1;
-  if (g_coll > 0) ::kill(g_coll, SIGTERM);
-  if (g_serve_pid > 0) ::kill(g_serve_pid, SIGTERM);
+  int c = g_coll.load(std::memory_order_relaxed);
+  int s = g_serve_pid.load(std::memory_order_relaxed);
+  if (c > 0) ::kill(c, SIGTERM);
+  if (s > 0) ::kill(s, SIGTERM);
+}
+
+void ForgetPid(std::atomic<int>& slot) {
+  sigset_t block, old;
+  sigemptyset(&block);
+  sigaddset(&block, SIGINT);
+  sigaddset(&block, SIGTERM);
+  sigaddset(&block, SIGHUP);
+  ::sigprocmask(SIG_BLOCK, &block, &old);
+  slot.store(-1, std::memory_order_relaxed);
+  ::sigprocmask(SIG_SETMASK, &old, nullptr);
 }
 
 int ChildStatus(int st) {
@@ -576,50 +656,74 @@ int ChildStatus(int st) {
 }
 
 int Reap(pid_t coll, pid_t serve) {
-  g_coll = coll;
-  g_serve_pid = serve;
-  struct sigaction sa {};
-  sa.sa_handler = OnStop;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  ::sigaction(SIGINT, &sa, nullptr);
-  ::sigaction(SIGTERM, &sa, nullptr);
+  g_coll.store(static_cast<int>(coll), std::memory_order_relaxed);
+  g_serve_pid.store(static_cast<int>(serve), std::memory_order_relaxed);
 
   bool got_c = false;
   bool got_s = false;
   int code_c = 0;
   int code_s = 0;
+  bool escalated = false;
+  long deadline = MonoMs() + 3000;
+  const long give_up = MonoMs() + 8000;
   while (!got_c || !got_s) {
+    if (MonoMs() > give_up) break;
     int st = 0;
-    pid_t p = ::waitpid(-1, &st, 0);
+    pid_t p = ::waitpid(-1, &st, WNOHANG);
     if (p < 0) {
       if (errno == EINTR) continue;
-      break;
+      if (errno == ECHILD) break;
+    } else if (p > 0) {
+      if (p == coll && !got_c) {
+        got_c = true;
+        code_c = ChildStatus(st);
+        ForgetPid(g_coll);
+        if (!got_s) ::kill(serve, SIGTERM);
+        deadline = MonoMs() + 3000;
+      } else if (p == serve && !got_s) {
+        got_s = true;
+        code_s = ChildStatus(st);
+        ForgetPid(g_serve_pid);
+        if (!got_c) ::kill(coll, SIGTERM);
+        deadline = MonoMs() + 3000;
+      }
+      continue;
     }
-    if (p == coll) {
-      got_c = true;
-      code_c = ChildStatus(st);
-      if (!got_s) ::kill(serve, SIGTERM);
-    } else if (p == serve) {
-      got_s = true;
-      code_s = ChildStatus(st);
-      if (!got_c) ::kill(coll, SIGTERM);
+    if (MonoMs() > deadline && !escalated) {
+      if (!got_c) ::kill(coll, SIGKILL);
+      if (!got_s) ::kill(serve, SIGKILL);
+      escalated = true;
+      deadline = MonoMs() + 2000;
     }
+    timespec ts{};
+    ts.tv_nsec = 50000000L;
+    ::nanosleep(&ts, nullptr);
   }
-  if (!got_c) {
-    ::kill(coll, SIGKILL);
-    ::waitpid(coll, nullptr, 0);
-  }
-  if (!got_s) {
-    ::kill(serve, SIGKILL);
-    ::waitpid(serve, nullptr, 0);
-  }
+  ForgetPid(g_coll);
+  ForgetPid(g_serve_pid);
   if (g_stop) return 0;
+  if (!got_c || !got_s) return 1;
   if (code_s != 0) return code_s;
   return code_c;
 }
 
 }  // namespace
+
+bool ParsePortToken(const std::string& text, int* port, std::string* err) {
+  if (text.empty()) {
+    if (err) *err = "missing listen port";
+    return false;
+  }
+  errno = 0;
+  char* end = nullptr;
+  long v = std::strtol(text.c_str(), &end, 10);
+  if (end == text.c_str() || (end && *end != '\0') || errno == ERANGE || v < 0 || v > 65535) {
+    if (err) *err = "listen port must be an integer 0..65535";
+    return false;
+  }
+  *port = static_cast<int>(v);
+  return true;
+}
 
 ListenSpec ParseListenSpec(std::string_view text) {
   ListenSpec s;
@@ -638,7 +742,7 @@ ListenSpec ParseListenSpec(std::string_view text) {
     }
     s.host = t.substr(1, rb - 1);
     s.ipv6 = true;
-    s.port = std::atoi(t.c_str() + rb + 2);
+    if (!ParsePortToken(t.substr(rb + 2), &s.port, &s.error)) return s;
   } else if (t.find(':') != t.rfind(':')) {
     s.error = "ipv6 listen spec must look like [::1]:port";
     return s;
@@ -646,14 +750,14 @@ ListenSpec ParseListenSpec(std::string_view text) {
     auto colon = t.rfind(':');
     if (colon == std::string::npos) {
       s.host = "127.0.0.1";
-      s.port = std::atoi(t.c_str());
+      if (!ParsePortToken(t, &s.port, &s.error)) return s;
     } else {
       s.host = t.substr(0, colon);
       if (s.host.empty()) {
         s.error = "empty host is not loopback; use 127.0.0.1:9100";
         return s;
       }
-      s.port = std::atoi(t.c_str() + colon + 1);
+      if (!ParsePortToken(t.substr(colon + 1), &s.port, &s.error)) return s;
     }
   }
   if (s.port < 0 || s.port > 65535) {
@@ -700,26 +804,45 @@ std::string ListenerPolicyError(const ListenSpec& spec, const std::string& api_k
 }
 
 std::string ReadApiKeyFile(const std::string& path, std::string* err) {
-  std::ifstream in(path);
-  if (!in) {
-    if (err) *err = "cannot open API key file: " + path;
+  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    if (err) {
+      if (errno == ELOOP) *err = "API key file is a symlink; refusing: " + path;
+      else *err = "cannot open API key file: " + path;
+    }
     return {};
   }
-  std::string line;
-  if (!std::getline(in, line)) {
-    if (err) *err = "API key file is empty: " + path;
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(fd);
+    if (err) *err = "API key file must be a regular file: " + path;
     return {};
   }
+  if ((st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    ::close(fd);
+    if (err) *err = "API key file is readable by group or other; refusing: " + path;
+    return {};
+  }
+  std::string data;
+  char buf[512];
+  ssize_t n = ::read(fd, buf, sizeof(buf));
+  ::close(fd);
+  if (n < 0) {
+    if (err) *err = "cannot read API key file: " + path;
+    return {};
+  }
+  data.assign(buf, static_cast<size_t>(n));
+  auto nl = data.find('\n');
+  std::string line = nl == std::string::npos ? data : data.substr(0, nl);
   if (!line.empty() && line.back() == '\r') line.pop_back();
   line = Trim(line);
   if (line.empty()) {
     if (err) *err = "API key file is empty: " + path;
     return {};
   }
-  struct stat st {};
-  if (::stat(path.c_str(), &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO))) {
-    std::cerr << "llama.SPY: warning: API key file is readable by group or other: " << path
-              << "\n";
+  if (line.find('\n') != std::string::npos || line.find('\r') != std::string::npos) {
+    if (err) *err = "API key file must be a single line: " + path;
+    return {};
   }
   return line;
 }
@@ -727,7 +850,7 @@ std::string ReadApiKeyFile(const std::string& path, std::string* err) {
 void SandboxCollector(int ipc_fd, bool strict) {
   (void)ipc_fd;
 #if defined(__linux__)
-  DenyBindFamily(strict);
+  if (!DenyBindFamily(strict)) _exit(1);
   if (strict) {
     std::cerr << "llama.SPY collector: seccomp denies bind/listen/accept/connect/open\n";
   } else {
@@ -742,17 +865,40 @@ void SandboxCollector(int ipc_fd, bool strict) {
 #endif
 }
 
+void PrepareChild() {
+  ::signal(SIGINT, SIG_DFL);
+  ::signal(SIGTERM, SIG_DFL);
+  ::signal(SIGHUP, SIG_DFL);
+  ::signal(SIGPIPE, SIG_IGN);
+  ArmParentDeath(SIGTERM);
+}
+
 int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>& collector) {
   std::string policy = ListenerPolicyError(cfg.listen, cfg.api_key);
   if (!policy.empty()) {
     std::cerr << "llama.SPY: " << policy;
     return 2;
   }
-  ::signal(SIGPIPE, SIG_IGN);
+  sigset_t block, oldset;
+  sigemptyset(&block);
+  sigaddset(&block, SIGINT);
+  sigaddset(&block, SIGTERM);
+  sigaddset(&block, SIGHUP);
+  sigaddset(&block, SIGCHLD);
+  ::sigprocmask(SIG_BLOCK, &block, &oldset);
+  struct sigaction sa {};
+  sa.sa_handler = OnStop;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  ::sigaction(SIGINT, &sa, nullptr);
+  ::sigaction(SIGTERM, &sa, nullptr);
+  ::sigaction(SIGHUP, &sa, nullptr);
+
   int sv[2] = {-1, -1};
   if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0) {
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
       std::cerr << "llama.SPY: socketpair failed: " << std::strerror(errno) << "\n";
+      ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
       return 1;
     }
   }
@@ -762,16 +908,22 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
     std::cerr << "llama.SPY: fork collector failed\n";
     ::close(sv[0]);
     ::close(sv[1]);
+    ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     return 1;
   }
   if (coll == 0) {
     ::close(sv[1]);
-    ::signal(SIGPIPE, SIG_IGN);
-#if defined(__linux__)
-    ::prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
+    PrepareChild();
+    ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     ScrubFds(sv[0]);
-    std::cerr << "llama.SPY collector running pid=" << ::getpid() << " (no network listen)\n";
+    char line[128];
+    int n = std::snprintf(line, sizeof(line),
+                          "llama.SPY collector running pid=%d (no network listen)\n",
+                          static_cast<int>(::getpid()));
+    if (n > 0) {
+      ssize_t wr = ::write(STDERR_FILENO, line, static_cast<size_t>(n));
+      (void)wr;
+    }
     int rc = 1;
     try {
       rc = collector(sv[0]);
@@ -783,26 +935,35 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
   pid_t serve = ::fork();
   if (serve < 0) {
     ::kill(coll, SIGTERM);
-    ::waitpid(coll, nullptr, 0);
+    ReapChild(coll, SIGTERM);
     ::close(sv[0]);
     ::close(sv[1]);
+    ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     std::cerr << "llama.SPY: fork serve failed\n";
     return 1;
   }
   if (serve == 0) {
     ::close(sv[0]);
-    ::signal(SIGPIPE, SIG_IGN);
-#if defined(__linux__)
-    ::prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
+    PrepareChild();
+    ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     ScrubFds(sv[1]);
     int rc = ServeChild(sv[1], cfg);
     _exit(rc);
   }
   ::close(sv[0]);
   ::close(sv[1]);
-  std::cerr << "llama.SPY parent reaper pid=" << ::getpid() << " collector=" << coll
-            << " serve=" << serve << "\n";
+  g_coll.store(static_cast<int>(coll), std::memory_order_relaxed);
+  g_serve_pid.store(static_cast<int>(serve), std::memory_order_relaxed);
+  ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
+  char line[160];
+  int n = std::snprintf(line, sizeof(line),
+                        "llama.SPY parent reaper pid=%d collector=%d serve=%d\n",
+                        static_cast<int>(::getpid()), static_cast<int>(coll),
+                        static_cast<int>(serve));
+  if (n > 0) {
+    ssize_t wr = ::write(STDERR_FILENO, line, static_cast<size_t>(n));
+    (void)wr;
+  }
   return Reap(coll, serve);
 }
 

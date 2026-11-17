@@ -54,71 +54,108 @@ bool ParseJsonString(std::string_view& s, std::string* out) {
   return false;
 }
 
-// Extract "key": <string|number|bool|object-as-text|array-of-strings> at top level
-// or inside a shallow object. Very small subset — good enough for HookScript v1.
-bool FindKeyValue(std::string_view obj, std::string_view key, std::string* value_out,
-                  bool* is_string_out) {
-  // Search for "key"
-  std::string needle = "\"";
-  needle += key;
-  needle += "\"";
-  std::size_t pos = 0;
-  while (pos < obj.size()) {
-    auto found = obj.find(needle, pos);
-    if (found == std::string_view::npos) return false;
-    // Ensure it's a key (followed by optional ws and ':')
-    std::string_view rest = obj.substr(found + needle.size());
-    if (!SkipWs(rest) || rest.front() != ':') {
-      pos = found + 1;
-      continue;
-    }
-    rest.remove_prefix(1);
-    if (!SkipWs(rest)) return false;
-    if (rest.front() == '"') {
-      std::string v;
-      if (!ParseJsonString(rest, &v)) return false;
-      *value_out = v;
-      if (is_string_out) *is_string_out = true;
-      return true;
-    }
-    if (rest.front() == '{' || rest.front() == '[') {
-      // Capture balanced brace/bracket as raw text
-      char open = rest.front();
-      char close = (open == '{') ? '}' : ']';
-      int depth = 0;
-      std::size_t i = 0;
-      bool in_str = false;
-      bool esc = false;
-      for (; i < rest.size(); ++i) {
-        char c = rest[i];
-        if (in_str) {
-          if (esc) esc = false;
-          else if (c == '\\') esc = true;
-          else if (c == '"') in_str = false;
-          continue;
-        }
-        if (c == '"') {
-          in_str = true;
-          continue;
-        }
-        if (c == open) ++depth;
-        else if (c == close) {
-          --depth;
-          if (depth == 0) {
-            *value_out = std::string(rest.substr(0, i + 1));
-            if (is_string_out) *is_string_out = false;
-            return true;
-          }
+// Value text starting at rest. Used only after a matching top-level key.
+bool TakeValue(std::string_view rest, std::string* value_out, bool* is_string_out) {
+  if (!SkipWs(rest)) return false;
+  if (rest.front() == '"') {
+    std::string v;
+    if (!ParseJsonString(rest, &v)) return false;
+    *value_out = v;
+    if (is_string_out) *is_string_out = true;
+    return true;
+  }
+  if (rest.front() == '{' || rest.front() == '[') {
+    char open = rest.front();
+    char close = (open == '{') ? '}' : ']';
+    int depth = 0;
+    bool in_str = false;
+    bool esc = false;
+    for (std::size_t i = 0; i < rest.size(); ++i) {
+      char c = rest[i];
+      if (in_str) {
+        if (esc) esc = false;
+        else if (c == '\\') esc = true;
+        else if (c == '"') in_str = false;
+        continue;
+      }
+      if (c == '"') {
+        in_str = true;
+        continue;
+      }
+      if (c == open) ++depth;
+      else if (c == close) {
+        --depth;
+        if (depth == 0) {
+          *value_out = std::string(rest.substr(0, i + 1));
+          if (is_string_out) *is_string_out = false;
+          return true;
         }
       }
-      return false;
     }
-    // number / bool / null — read until comma or }
-    std::size_t i = 0;
-    while (i < rest.size() && rest[i] != ',' && rest[i] != '}' && rest[i] != ']') ++i;
-    *value_out = Trim(rest.substr(0, i));
-    if (is_string_out) *is_string_out = false;
-    return true;
+    return false;
+  }
+  std::size_t i = 0;
+  while (i < rest.size() && rest[i] != ',' && rest[i] != '}' && rest[i] != ']') ++i;
+  *value_out = Trim(rest.substr(0, i));
+  if (is_string_out) *is_string_out = false;
+  return !value_out->empty();
+}
+
+// Keys only at depth 1 of this object. A "js_body" nested in a schema is ignored.
+// Strings are not searched, so a quoted schema cannot smuggle a key.
+bool FindKeyValue(std::string_view obj, std::string_view key, std::string* value_out,
+                  bool* is_string_out) {
+  std::size_t i = 0;
+  while (i < obj.size() && std::isspace(static_cast<unsigned char>(obj[i]))) ++i;
+  if (i >= obj.size() || obj[i] != '{') return false;
+  int depth = 0;
+  bool in_str = false;
+  bool esc = false;
+  for (; i < obj.size(); ++i) {
+    char c = obj[i];
+    if (in_str) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == '"') in_str = false;
+      continue;
+    }
+    if (c == '"') {
+      if (depth == 1) {
+        std::string_view rest = obj.substr(i);
+        std::string k;
+        if (!ParseJsonString(rest, &k)) return false;
+        i = obj.size() - rest.size();
+        while (i < obj.size() && std::isspace(static_cast<unsigned char>(obj[i]))) ++i;
+        if (i >= obj.size() || obj[i] != ':') return false;
+        ++i;
+        while (i < obj.size() && std::isspace(static_cast<unsigned char>(obj[i]))) ++i;
+        if (k == key) return TakeValue(obj.substr(i), value_out, is_string_out);
+        if (i >= obj.size()) return false;
+        if (obj[i] == '"') {
+          std::string dummy;
+          std::string_view r = obj.substr(i);
+          if (!ParseJsonString(r, &dummy)) return false;
+          i = obj.size() - r.size();
+          if (i > 0) --i;
+          continue;
+        }
+        if (obj[i] != '{' && obj[i] != '[') {
+          while (i < obj.size() && obj[i] != ',' && obj[i] != '}') ++i;
+          if (i > 0) --i;
+          continue;
+        }
+        // Nested object or array: let the depth scan consume it.
+        if (i > 0) --i;
+        continue;
+      }
+      in_str = true;
+      continue;
+    }
+    if (c == '{' || c == '[') ++depth;
+    else if (c == '}' || c == ']') {
+      if (depth > 0) --depth;
+      if (depth == 0) return false;
+    }
   }
   return false;
 }

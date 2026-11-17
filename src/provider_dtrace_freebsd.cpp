@@ -7,6 +7,7 @@
 // On non-FreeBSD hosts (e.g. this Linux CI/box): the provider compiles as a
 // stub that returns AttachStatus::NotSupported so CMake still links.
 
+#include "llamaspy/proc_util.hpp"
 #include "llamaspy/telemetry_provider.hpp"
 #include "llamaspy/trace_parse.hpp"
 
@@ -44,7 +45,7 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
     // Spawn: dtrace -p PID -s script
     // TODO: prefer libdtrace embedding for tighter SnoopV1 integration.
     int pipefd[2];
-    if (pipe(pipefd) != 0) return AttachStatus::Failed;
+    if (PipeCloexec(pipefd) != 0) return AttachStatus::Failed;
     child_ = fork();
     if (child_ < 0) {
       close(pipefd[0]);
@@ -52,6 +53,8 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       return AttachStatus::Failed;
     }
     if (child_ == 0) {
+      ArmParentDeath(SIGTERM);
+      ::setpgid(0, 0);
       close(pipefd[0]);
       dup2(pipefd[1], STDOUT_FILENO);
       close(pipefd[1]);
@@ -76,7 +79,10 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
     if (!attached_ || !fp_) return false;
     char line[512];
     if (!fgets(line, sizeof(line), fp_)) {
-      // EOF or error — stop
+      if (errno == EINTR) {
+        clearerr(fp_);
+        return true;
+      }
       return false;
     }
     TraceSample sample;
@@ -101,8 +107,7 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       fp_ = nullptr;
     }
     if (child_ > 0) {
-      kill(child_, SIGTERM);
-      waitpid(child_, nullptr, 0);
+      ReapChild(child_, SIGTERM);
       child_ = -1;
     }
   }

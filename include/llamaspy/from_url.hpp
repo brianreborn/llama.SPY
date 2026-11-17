@@ -18,9 +18,17 @@ struct DraftWriteResult {
   std::string error;
 };
 
-// Fetch url (http, or https via curl/fetch) and write a draft JSON file.
+// https and public hosts by default. Tests and explicit CLI flags opt in.
+struct UrlFetchOptions {
+  bool allow_http = false;
+  bool allow_private = false;
+};
+
+// Fetch url and write a draft JSON file. Remote code is never executed.
 // out_path "-" writes the document to stdout and sets path to "-".
-// Empty out_path uses "llamaspy-hook.draft.json" in the current directory.
-DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string& out_path);
+// Empty out_path uses "llamaspy-hook.draft.json". Existing files are kept
+// unless overwrite is true. The temporary file is created with mkstemp.
+DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string& out_path,
+                                       bool overwrite = false, UrlFetchOptions opt = {});
 
 }  // namespace llamaspy

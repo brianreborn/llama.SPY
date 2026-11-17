@@ -107,9 +107,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
 endif()
 
 add_executable(test_from_url tests/test_from_url.cpp src/from_url.cpp src/hook_script.cpp
-               src/game_genie.cpp src/tool_registry.cpp)
+               src/game_genie.cpp src/tool_registry.cpp src/js_engine.cpp src/mem_read.cpp)
 target_include_directories(test_from_url PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_from_url PRIVATE Threads::Threads)
+if(M_LIB)
+  target_link_libraries(test_from_url PRIVATE ${M_LIB})
+endif()
+if(LLAMASPY_HAVE_DUKTAPE)
+  target_sources(test_from_url PRIVATE ${LLAMASPY_DUKTAPE_DIR}/duktape.c)
+  target_include_directories(test_from_url PRIVATE ${LLAMASPY_DUKTAPE_DIR})
+  target_compile_definitions(test_from_url PRIVATE LLAMASPY_JS=1)
+  set_source_files_properties(${LLAMASPY_DUKTAPE_DIR}/duktape.c PROPERTIES
+    COMPILE_FLAGS "-Wno-unused-parameter -Wno-unused-function")
+else()
+  target_compile_definitions(test_from_url PRIVATE LLAMASPY_JS=0)
+endif()
 
 add_executable(test_trace_parse tests/test_trace_parse.cpp src/trace_parse.cpp)
 target_include_directories(test_trace_parse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -122,7 +134,9 @@ add_test(NAME trace_parse COMMAND test_trace_parse)
 add_test(NAME cli_serve COMMAND sh ${CMAKE_SOURCE_DIR}/tests/cli_serve_test.sh $<TARGET_FILE:llamaspy>)
 add_test(NAME no_target_writes COMMAND sh ${CMAKE_SOURCE_DIR}/tests/no_target_writes.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME hook_smoke COMMAND sh ${CMAKE_SOURCE_DIR}/bin/run-hook-smoke.sh)
+add_test(NAME tracer_cleanup COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tracer_cleanup_test.sh
+         $<TARGET_FILE:llamaspy> ${CMAKE_SOURCE_DIR})
 add_test(NAME gen_gg_offsets COMMAND sh ${CMAKE_SOURCE_DIR}/tests/gen_gg_offsets_test.sh
          $<TARGET_FILE:test_mem_read> ${CMAKE_SOURCE_DIR}/scripts/gen-gg-offsets.sh)
-set_tests_properties(mem_read serve_policy from_url trace_parse cli_serve no_target_writes hook_smoke gen_gg_offsets
+set_tests_properties(mem_read serve_policy from_url trace_parse cli_serve no_target_writes hook_smoke gen_gg_offsets tracer_cleanup
                      PROPERTIES TIMEOUT 60)

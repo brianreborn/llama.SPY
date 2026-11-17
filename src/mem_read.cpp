@@ -1,4 +1,5 @@
 #include "llamaspy/mem_read.hpp"
+#include "llamaspy/proc_util.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -23,17 +24,26 @@ extern "C" ssize_t process_vm_readv(pid_t pid, const struct iovec* local_iov,
                                      unsigned long riovcnt, unsigned long flags);
 #endif
 
+#if defined(__linux__)
+#  include <sys/syscall.h>
+#endif
+
 #if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+#  include <sys/proc.h>
 #  include <sys/ptrace.h>
+#  include <sys/sysctl.h>
+#  include <sys/user.h>
 #  include <sys/wait.h>
 #endif
 
 namespace llamaspy {
 namespace {
 
+#if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
 std::string ErrnoText() {
   return std::strerror(errno);
 }
+#endif
 
 std::string Trim(std::string s) {
   while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
@@ -136,6 +146,7 @@ class FdReader {
   explicit FdReader(const std::string& path) {
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   }
+  explicit FdReader(int fd) : fd_(fd) {}
   FdReader(const FdReader&) = delete;
   FdReader& operator=(const FdReader&) = delete;
   FdReader(FdReader&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
@@ -396,10 +407,65 @@ std::string PermissionAdvice(uint32_t pid) {
 }
 
 bool ProcExists(uint32_t pid) {
-  std::string p = "/proc/" + std::to_string(pid);
-  struct stat st {};
-  return ::stat(p.c_str(), &st) == 0;
+  if (pid == 0) return false;
+  if (::kill(static_cast<pid_t>(pid), 0) == 0) return true;
+  // EPERM means the pid is alive and owned by someone else.
+  return errno == EPERM;
 }
+
+#if defined(__linux__)
+#  ifndef SYS_pidfd_open
+#    if defined(__x86_64__)
+#      define SYS_pidfd_open 434
+#    elif defined(__aarch64__)
+#      define SYS_pidfd_open 434
+#    elif defined(__i386__)
+#      define SYS_pidfd_open 434
+#    endif
+#  endif
+#  ifndef SYS_pidfd_send_signal
+#    if defined(__x86_64__)
+#      define SYS_pidfd_send_signal 424
+#    elif defined(__aarch64__)
+#      define SYS_pidfd_send_signal 424
+#    elif defined(__i386__)
+#      define SYS_pidfd_send_signal 424
+#    endif
+#  endif
+
+bool LinuxStartTicks(uint32_t pid, uint64_t* ticks) {
+  std::ifstream in("/proc/" + std::to_string(pid) + "/stat");
+  std::string s;
+  if (!std::getline(in, s)) return false;
+  auto rp = s.rfind(')');
+  if (rp == std::string::npos) return false;
+  std::istringstream iss(s.substr(rp + 1));
+  std::string tok;
+  // Field 22 (starttime) is the 20th token after ")".
+  for (int i = 0; i < 20; ++i) {
+    if (!(iss >> tok)) return false;
+  }
+  char* end = nullptr;
+  unsigned long long v = std::strtoull(tok.c_str(), &end, 10);
+  if (end == tok.c_str()) return false;
+  *ticks = static_cast<uint64_t>(v);
+  return true;
+}
+#endif
+
+#if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+bool FreebsdProc(uint32_t pid, uint64_t* sec, uint64_t* usec, int* stat_out) {
+  struct kinfo_proc kp {};
+  size_t len = sizeof(kp);
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, static_cast<int>(pid)};
+  if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0) return false;
+  if (len < sizeof(kp)) return false;
+  if (sec) *sec = static_cast<uint64_t>(kp.ki_start.tv_sec);
+  if (usec) *usec = static_cast<uint64_t>(kp.ki_start.tv_usec);
+  if (stat_out) *stat_out = kp.ki_stat;
+  return true;
+}
+#endif
 
 #if defined(__linux__)
 bool ReadVm(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err) {
@@ -414,11 +480,14 @@ bool ReadVm(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err) 
     remote.iov_len = n - got;
     ssize_t r = ::process_vm_readv(static_cast<pid_t>(pid), &local, 1, &remote, 1, 0);
     if (r < 0) {
-      if (errno == EINTR) continue;
+      int e = errno;
+      if (e == EINTR) continue;
+      errno = e;
       if (err) {
-        if (errno == EPERM || errno == EACCES) *err = PermissionAdvice(pid) + " (" + ErrnoText() + ")";
-        else *err = std::string("process_vm_readv: ") + ErrnoText();
+        if (e == EPERM || e == EACCES) *err = PermissionAdvice(pid) + " (" + std::strerror(e) + ")";
+        else *err = std::string("process_vm_readv: ") + std::strerror(e);
       }
+      errno = e;
       return false;
     }
     if (r == 0) {
@@ -431,15 +500,21 @@ bool ReadVm(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err) 
 }
 #endif
 
-bool ReadProcMem(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err) {
-  std::string path = "/proc/" + std::to_string(pid) + "/mem";
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+bool ReadProcMem(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err, int proc_dir) {
+  int fd = -1;
+  if (proc_dir >= 0) fd = ::openat(proc_dir, "mem", O_RDONLY | O_CLOEXEC);
+  else {
+    std::string path = "/proc/" + std::to_string(pid) + "/mem";
+    fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  }
   if (fd < 0) {
+    int e = errno;
     if (err) {
-      if (errno == EPERM || errno == EACCES) *err = PermissionAdvice(pid) + " (" + ErrnoText() + ")";
-      else if (errno == ENOENT) *err = "cannot open " + path + " (procfs not mounted or no such process)";
-      else *err = "open " + path + ": " + ErrnoText();
+      if (e == EPERM || e == EACCES) *err = PermissionAdvice(pid) + " (" + std::strerror(e) + ")";
+      else if (e == ENOENT) *err = "cannot open /proc/PID/mem (procfs not mounted or no such process)";
+      else *err = std::string("open /proc/PID/mem: ") + std::strerror(e);
     }
+    errno = e;
     return false;
   }
   uint8_t* out = static_cast<uint8_t*>(buf);
@@ -447,11 +522,13 @@ bool ReadProcMem(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* 
   while (got < n) {
     ssize_t r = ::pread(fd, out + got, n - got, static_cast<off_t>(addr + got));
     if (r < 0) {
-      if (errno == EINTR) continue;
+      int e = errno;
+      if (e == EINTR) continue;
       if (err) {
-        if (errno == EPERM || errno == EACCES) *err = PermissionAdvice(pid) + " (" + ErrnoText() + ")";
-        else *err = std::string("pread /proc/PID/mem: ") + ErrnoText();
+        if (e == EPERM || e == EACCES) *err = PermissionAdvice(pid) + " (" + std::strerror(e) + ")";
+        else *err = std::string("pread /proc/PID/mem: ") + std::strerror(e);
       }
+      errno = e;
       ::close(fd);
       return false;
     }
@@ -467,16 +544,92 @@ bool ReadProcMem(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* 
 }
 
 #if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
-bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err) {
-  if (::ptrace(PT_ATTACH, static_cast<pid_t>(pid), nullptr, 0) != 0) {
+bool DetachPtrace(uint32_t pid, int pass_sig, std::string* err) {
+  if (::ptrace(PT_DETACH, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), pass_sig) == 0) {
+    return true;
+  }
+  int e = errno;
+  if (::ptrace(PT_DETACH, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), 0) == 0) {
     if (err) {
-      if (errno == EPERM || errno == EACCES) *err = PermissionAdvice(pid) + " (" + ErrnoText() + ")";
-      else *err = std::string("ptrace PT_ATTACH: ") + ErrnoText();
+      *err = "ptrace PT_DETACH could not forward signal " + std::to_string(pass_sig) +
+             "; detached with no signal";
     }
+    return true;
+  }
+  if (err) {
+    *err = std::string("ptrace PT_DETACH failed; target may still be stopped: ") + std::strerror(e);
+  }
+  return false;
+}
+
+bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err) {
+  sigset_t block, old;
+  sigemptyset(&block);
+  sigaddset(&block, SIGINT);
+  sigaddset(&block, SIGTERM);
+  sigaddset(&block, SIGHUP);
+  ::sigprocmask(SIG_BLOCK, &block, &old);
+  auto restore = [&]() { ::sigprocmask(SIG_SETMASK, &old, nullptr); };
+
+  bool was_stopped = false;
+  int kstat = 0;
+  if (FreebsdProc(pid, nullptr, nullptr, &kstat)) was_stopped = (kstat == SSTOP);
+
+  if (::ptrace(PT_ATTACH, static_cast<pid_t>(pid), nullptr, 0) != 0) {
+    int e = errno;
+    if (err) {
+      if (e == EPERM || e == EACCES) *err = PermissionAdvice(pid) + " (" + std::strerror(e) + ")";
+      else if (e == EBUSY) {
+        *err = "ptrace PT_ATTACH: target is already traced (EBUSY). "
+               "A dtrace -p session on this pid blocks PT_IO. "
+               "llama.SPY never writes.";
+      } else {
+        *err = std::string("ptrace PT_ATTACH: ") + std::strerror(e);
+      }
+    }
+    restore();
     return false;
   }
-  int st = 0;
-  ::waitpid(static_cast<pid_t>(pid), &st, 0);
+
+  int pending_sig = 0;
+  bool saw_attach_stop = false;
+  for (int spins = 0; spins < 64 && !saw_attach_stop; ++spins) {
+    int st = 0;
+    pid_t w = ::waitpid(static_cast<pid_t>(pid), &st, 0);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      if (err) *err = std::string("waitpid after PT_ATTACH: ") + ErrnoText();
+      DetachPtrace(pid, 0, nullptr);
+      restore();
+      return false;
+    }
+    if (WIFEXITED(st) || WIFSIGNALED(st)) {
+      if (err) *err = "target exited during ptrace attach";
+      restore();
+      return false;
+    }
+    if (!WIFSTOPPED(st)) continue;
+    int sig = WSTOPSIG(st);
+    if (sig == SIGSTOP) {
+      saw_attach_stop = true;
+      break;
+    }
+    // A stop that is not our attach SIGSTOP is a signal the target must keep.
+    if (sig > 0 && pending_sig == 0) pending_sig = sig;
+    if (::ptrace(PT_CONTINUE, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), 0) != 0) {
+      if (err) *err = std::string("ptrace PT_CONTINUE while waiting for SIGSTOP: ") + ErrnoText();
+      DetachPtrace(pid, pending_sig, nullptr);
+      restore();
+      return false;
+    }
+  }
+  if (!saw_attach_stop) {
+    if (err) *err = "target did not stop with SIGSTOP after PT_ATTACH";
+    DetachPtrace(pid, pending_sig, nullptr);
+    restore();
+    return false;
+  }
+
   struct ptrace_io_desc iod {};
   iod.piod_op = PIOD_READ_D;
   iod.piod_offs = reinterpret_cast<void*>(static_cast<uintptr_t>(addr));
@@ -484,31 +637,65 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
   iod.piod_len = n;
   bool ok = ::ptrace(PT_IO, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(&iod),
                      static_cast<int>(sizeof(iod))) == 0;
-  if (!ok && err) {
-    if (errno == EPERM || errno == EACCES) *err = PermissionAdvice(pid) + " (" + ErrnoText() + ")";
-    else *err = std::string("ptrace PT_IO PIOD_READ_D: ") + ErrnoText();
+  int io_err = errno;
+  std::string detach_err;
+  bool detached = DetachPtrace(pid, pending_sig, &detach_err);
+  if (was_stopped) {
+    // PT_DETACH resumes. Put an already-stopped target back to sleep.
+    ::kill(static_cast<pid_t>(pid), SIGSTOP);
   }
-  // Always detach. data 0 continues the target with no signal.
-  ::ptrace(PT_DETACH, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), 0);
+  if (!ok && err) {
+    if (io_err == EPERM || io_err == EACCES) *err = PermissionAdvice(pid) + " (" + std::strerror(io_err) + ")";
+    else if (io_err == EBUSY) {
+      *err = "ptrace PT_IO: target is busy (EBUSY), often because dtrace -p already holds it";
+    } else {
+      *err = std::string("ptrace PT_IO PIOD_READ_D: ") + std::strerror(io_err);
+    }
+  }
+  if (!detached) {
+    if (err) {
+      if (!err->empty()) *err += "; ";
+      *err += detach_err.empty() ? "PT_DETACH failed" : detach_err;
+    }
+    ok = false;
+  }
+  restore();
   return ok;
 }
 #endif
 
-std::vector<MapRange> MapsFromProc(uint32_t pid, std::string* err) {
-  std::string path = "/proc/" + std::to_string(pid) + "/maps";
-  std::ifstream in(path);
-  if (!in) {
-    if (err) *err = "cannot read " + path;
+std::string ReadFdAll(int fd) {
+  std::string out;
+  char buf[4096];
+  for (;;) {
+    ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (n == 0) break;
+    out.append(buf, static_cast<size_t>(n));
+    if (out.size() > (8u << 20)) break;
+  }
+  return out;
+}
+
+std::vector<MapRange> MapsFromProc(uint32_t pid, int proc_dir, std::string* err) {
+  int fd = -1;
+  if (proc_dir >= 0) fd = ::openat(proc_dir, "maps", O_RDONLY | O_CLOEXEC);
+  else fd = ::open(("/proc/" + std::to_string(pid) + "/maps").c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (err) *err = "cannot read /proc/PID/maps";
     return {};
   }
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  return ParseLinuxMapsText(ss.str());
+  std::string text = ReadFdAll(fd);
+  ::close(fd);
+  return ParseLinuxMapsText(text);
 }
 
 std::string CaptureCommand(const char* file, const char* const argv[]) {
   int fds[2];
-  if (::pipe(fds) != 0) return {};
+  if (PipeCloexec(fds) != 0) return {};
   pid_t c = ::fork();
   if (c < 0) {
     ::close(fds[0]);
@@ -516,10 +703,11 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
     return {};
   }
   if (c == 0) {
+    ArmParentDeath(SIGTERM);
     ::dup2(fds[1], STDOUT_FILENO);
     ::close(fds[0]);
     ::close(fds[1]);
-    int devnull = ::open("/dev/null", O_WRONLY);
+    int devnull = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (devnull >= 0) {
       ::dup2(devnull, STDERR_FILENO);
       ::close(devnull);
@@ -530,7 +718,16 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
   ::close(fds[1]);
   std::string out;
   char buf[1024];
+  timespec start {};
+  ::clock_gettime(CLOCK_MONOTONIC, &start);
   for (;;) {
+    timespec now {};
+    ::clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed = (now.tv_sec - start.tv_sec);
+    if (elapsed > 3) {
+      ::kill(c, SIGKILL);
+      break;
+    }
     ssize_t n = ::read(fds[0], buf, sizeof(buf));
     if (n < 0) {
       if (errno == EINTR) continue;
@@ -540,15 +737,20 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
     out.append(buf, static_cast<size_t>(n));
   }
   ::close(fds[0]);
-  int st = 0;
-  ::waitpid(c, &st, 0);
+  for (;;) {
+    int st = 0;
+    pid_t r = ::waitpid(c, &st, 0);
+    if (r == c || (r < 0 && errno != EINTR)) break;
+  }
   return out;
 }
 
-std::vector<MapRange> MapsForPid(uint32_t pid, std::string* err) {
+std::vector<MapRange> MapsForPid(uint32_t pid, int proc_dir, std::string* err) {
 #if defined(__linux__)
-  auto m = MapsFromProc(pid, err);
+  auto m = MapsFromProc(pid, proc_dir, err);
   if (!m.empty()) return m;
+#else
+  (void)proc_dir;
 #endif
   std::string procmap = "/proc/" + std::to_string(pid) + "/map";
   std::ifstream in(procmap);
@@ -594,8 +796,42 @@ uint64_t ComputeBias(const ModuleImage& m) {
   return low - first->vaddr;
 }
 
-std::vector<ModuleImage> LoadModules(uint32_t pid, std::string* err) {
-  auto ranges = MapsForPid(pid, err);
+int OpenModuleFd(int proc_dir, const std::string& path, const std::string& exe_path,
+                 const std::vector<MapRange>& ranges) {
+  // Prefer the inode that is actually mapped (map_files), not a path that
+  // may have been replaced on disk.
+  if (proc_dir >= 0 && !ranges.empty()) {
+    uint64_t low = ranges[0].start;
+    uint64_t end = ranges[0].end;
+    for (const auto& r : ranges) {
+      if (r.start < low) {
+        low = r.start;
+        end = r.end;
+      }
+    }
+    char rel[96];
+    std::snprintf(rel, sizeof(rel), "map_files/%lx-%lx", static_cast<unsigned long>(low),
+                  static_cast<unsigned long>(end));
+    int mapped = ::openat(proc_dir, rel, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (mapped >= 0) return mapped;
+  }
+  if (proc_dir >= 0 && !path.empty() && path[0] == '/') {
+    int root = ::openat(proc_dir, "root", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root >= 0) {
+      int fd = ::openat(root, path.c_str() + 1, O_RDONLY | O_CLOEXEC);
+      ::close(root);
+      if (fd >= 0) return fd;
+    }
+    if (!exe_path.empty() && path == exe_path) {
+      int exe = ::openat(proc_dir, "exe", O_RDONLY | O_CLOEXEC);
+      if (exe >= 0) return exe;
+    }
+  }
+  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+}
+
+std::vector<ModuleImage> LoadModules(uint32_t pid, int proc_dir, std::string* err) {
+  auto ranges = MapsForPid(pid, proc_dir, err);
   std::vector<std::string> order;
   std::vector<std::vector<MapRange>> groups;
   for (const auto& r : ranges) {
@@ -617,7 +853,9 @@ std::vector<ModuleImage> LoadModules(uint32_t pid, std::string* err) {
   // Prefer the live inode of the main executable when maps name a deleted path.
   char exe_buf[4096];
   std::string exe_link = "/proc/" + std::to_string(pid) + "/exe";
-  ssize_t en = ::readlink(exe_link.c_str(), exe_buf, sizeof(exe_buf) - 1);
+  ssize_t en = -1;
+  if (proc_dir >= 0) en = ::readlinkat(proc_dir, "exe", exe_buf, sizeof(exe_buf) - 1);
+  else en = ::readlink(exe_link.c_str(), exe_buf, sizeof(exe_buf) - 1);
   std::string exe_path;
   if (en > 0) {
     exe_buf[en] = 0;
@@ -631,23 +869,14 @@ std::vector<ModuleImage> LoadModules(uint32_t pid, std::string* err) {
     m.lowest = m.ranges[0].start;
     for (const auto& r : m.ranges)
       if (r.start < m.lowest) m.lowest = r.start;
-    std::string open_path = m.path;
-    FdReader rd(open_path);
-    if (!rd.ok() && !exe_path.empty()) {
-      // Same basename fallback: try /proc/PID/exe for the main binary.
-      if (m.path == exe_path || open_path == exe_path) {
-        rd = FdReader(exe_link);
-        open_path = exe_link;
-      }
+    int mfd = OpenModuleFd(proc_dir, m.path, exe_path, m.ranges);
+    FdReader rd(mfd);
+    if (!rd.ok() && !exe_path.empty() && m.path == exe_path) {
+      int exe = proc_dir >= 0 ? ::openat(proc_dir, "exe", O_RDONLY | O_CLOEXEC)
+                              : ::open(exe_link.c_str(), O_RDONLY | O_CLOEXEC);
+      rd = FdReader(exe);
     }
-    if (!rd.ok()) {
-      rd = FdReader(exe_link);
-      // only accept if this group is the executable
-      if (m.path != exe_path) {
-        continue;
-      }
-      open_path = exe_link;
-    }
+    if (!rd.ok()) continue;
     m.elf = ParseElf(rd);
     if (!m.elf.ok) continue;
     m.bias = ComputeBias(m);
@@ -819,7 +1048,7 @@ std::vector<MapRange> ParseProcstatVText(std::string_view text) {
 }
 
 bool ReadProcessBytes(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* err,
-                      MemBackend backend) {
+                      MemBackend backend, int proc_dir) {
   if (pid == 0 || buf == nullptr || n == 0 || n > 64) {
     if (err) *err = "invalid read (pid, buffer, or length)";
     return false;
@@ -847,12 +1076,12 @@ bool ReadProcessBytes(uint32_t pid, uint64_t addr, void* buf, size_t n, std::str
     if (saved == EPERM || saved == EACCES) return fail_perm(first);
     // Fall through to /proc/PID/mem for EIO / ENOSYS / other.
     std::string second;
-    if (ReadProcMem(pid, addr, buf, n, &second)) return true;
+    if (ReadProcMem(pid, addr, buf, n, &second, proc_dir)) return true;
     if (errno == EPERM || errno == EACCES) return fail_perm(second);
     if (err) *err = first.empty() ? second : first + "; fallback " + second;
     return false;
   }
-  if (backend == MemBackend::ProcMem) return ReadProcMem(pid, addr, buf, n, err);
+  if (backend == MemBackend::ProcMem) return ReadProcMem(pid, addr, buf, n, err, proc_dir);
   if (err) *err = "unsupported mem backend";
   return false;
 #elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
@@ -861,7 +1090,7 @@ bool ReadProcessBytes(uint32_t pid, uint64_t addr, void* buf, size_t n, std::str
     return false;
   }
   if (backend == MemBackend::Auto || backend == MemBackend::ProcMem) {
-    if (ReadProcMem(pid, addr, buf, n, err)) return true;
+    if (ReadProcMem(pid, addr, buf, n, err, proc_dir)) return true;
     if (backend == MemBackend::ProcMem) return false;
     if (errno == EPERM || errno == EACCES) return false;
   }
@@ -894,13 +1123,36 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     r.error = "no target pid; pass --pid to read the binding";
     return r;
   }
-  if (!ProcExists(pid)) {
+  ProcIdentity id = CaptureProcIdentity(pid);
+  struct IdClose {
+    ProcIdentity* held;
+    int dir;
+    ~IdClose() {
+      if (held) ReleaseProcIdentity(held);
+      if (dir >= 0) ::close(dir);
+    }
+  } guard{&id, -1};
+  if (!id.alive) {
     r.status = MemStatus::NoSuchProcess;
     r.error = "no such process: pid " + std::to_string(pid);
     return r;
   }
+  guard.dir = -1;
+#if defined(__linux__)
+  guard.dir = ::open(("/proc/" + std::to_string(pid)).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+#endif
+  if (!ProcIdentityStill(id)) {
+    r.status = MemStatus::NoSuchProcess;
+    r.error = "pid " + std::to_string(pid) + " exited or was reused before the read";
+    return r;
+  }
   std::string map_err;
-  auto mods = LoadModules(pid, &map_err);
+  auto mods = LoadModules(pid, guard.dir, &map_err);
+  if (!ProcIdentityStill(id)) {
+    r.status = MemStatus::NoSuchProcess;
+    r.error = "pid " + std::to_string(pid) + " exited or was reused during lookup";
+    return r;
+  }
   if (mods.empty()) {
     r.status = MemStatus::ReadError;
     r.error = map_err.empty() ? "no mapped ELF modules" : map_err;
@@ -912,7 +1164,17 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
   bool saw_any_id = false;
   for (auto& m : mods) {
     if (!m.elf.build_id.empty()) saw_any_id = true;
-    if (FingerprintAccepts(m.elf.build_id, binding.build_fp)) candidates.push_back(&m);
+    // An empty fp is not a free pass when the mapped image has a build-id.
+    if (constrained) {
+      if (FingerprintAccepts(m.elf.build_id, binding.build_fp)) candidates.push_back(&m);
+    } else if (m.elf.build_id.empty()) {
+      candidates.push_back(&m);
+    }
+  }
+  if (!constrained && saw_any_id && candidates.empty()) {
+    r.status = MemStatus::FingerprintMismatch;
+    r.error = "binding has no fp=buildid but a mapped module has a GNU build-id; refusing to read";
+    return r;
   }
   if (constrained && candidates.empty()) {
     r.status = MemStatus::FingerprintMismatch;
@@ -944,16 +1206,36 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     }
   }
 
+  auto add_u64 = [](uint64_t a, uint64_t b, uint64_t* out) {
+    if (a > ~uint64_t{0} - b) return false;
+    *out = a + b;
+    return true;
+  };
   uint64_t addr = 0;
   if (sym && chosen) {
-    if (sym->shndx == kShnAbs) addr = sym->value + binding.offset;
-    else addr = chosen->bias + sym->value + binding.offset;
+    if (sym->shndx == kShnAbs) {
+      if (!add_u64(sym->value, binding.offset, &addr)) {
+        r.status = MemStatus::ReadError;
+        r.error = "symbol address overflow";
+        return r;
+      }
+    } else {
+      uint64_t base = 0;
+      if (!add_u64(chosen->bias, sym->value, &base) || !add_u64(base, binding.offset, &addr)) {
+        r.status = MemStatus::ReadError;
+        r.error = "symbol address overflow";
+        return r;
+      }
+    }
     r.module_path = chosen->path;
     r.build_id = chosen->elf.build_id;
   } else if (binding.offset != 0 && candidates.size() == 1 && candidates[0]->bias_ok) {
-    // Symbol is a label only. off is module-relative (load bias + off).
     chosen = candidates[0];
-    addr = chosen->bias + binding.offset;
+    if (!add_u64(chosen->bias, binding.offset, &addr)) {
+      r.status = MemStatus::ReadError;
+      r.error = "module-relative address overflow";
+      return r;
+    }
     r.module_path = chosen->path;
     r.build_id = chosen->elf.build_id;
   } else {
@@ -967,23 +1249,51 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     r.error = o.str();
     return r;
   }
+  uint64_t addr_end = 0;
+  if (!add_u64(addr, r.width, &addr_end)) {
+    r.status = MemStatus::ReadError;
+    r.error = "read range overflow";
+    return r;
+  }
+  bool in_map = false;
+  if (chosen) {
+    for (const auto& rg : chosen->ranges) {
+      if (addr >= rg.start && addr_end <= rg.end) {
+        in_map = true;
+        break;
+      }
+    }
+  }
+  if (!in_map) {
+    r.status = MemStatus::ReadError;
+    r.error = "resolved address is outside the module mappings";
+    return r;
+  }
   r.address = addr;
 
   std::vector<uint8_t> bytes(r.width);
   std::string rerr;
-  if (!ReadProcessBytes(pid, addr, bytes.data(), bytes.size(), &rerr, backend)) {
+  if (!ReadProcessBytes(pid, addr, bytes.data(), bytes.size(), &rerr, backend, guard.dir)) {
     if (rerr.find("Permission denied") != std::string::npos ||
         rerr.find("ptrace_scope") != std::string::npos) {
       r.status = MemStatus::PermissionDenied;
-    } else if (rerr.find("no such process") != std::string::npos) {
+    } else if (rerr.find("no such process") != std::string::npos ||
+               rerr.find("exited or was reused") != std::string::npos) {
       r.status = MemStatus::NoSuchProcess;
     } else if (rerr.find("no read-only") != std::string::npos ||
-               rerr.find("not the") != std::string::npos) {
+               rerr.find("is the Linux backend") != std::string::npos ||
+               rerr.find("is the FreeBSD backend") != std::string::npos) {
       r.status = MemStatus::Unsupported;
     } else {
       r.status = MemStatus::ReadError;
     }
     r.error = rerr.empty() ? "read failed" : rerr;
+    return r;
+  }
+  if (!ProcIdentityStill(id)) {
+    r.status = MemStatus::NoSuchProcess;
+    r.error = "pid " + std::to_string(pid) + " exited or was reused during the read; discarded";
+    r.has_value = false;
     return r;
   }
   r.hex = HexEncode(bytes.data(), bytes.size());
@@ -1032,6 +1342,56 @@ std::string BindingReadJson(const BindingRead& r) {
   }
   o << "}";
   return o.str();
+}
+
+ProcIdentity CaptureProcIdentity(uint32_t pid) {
+  ProcIdentity id;
+  id.pid = pid;
+  if (!ProcExists(pid)) return id;
+  id.alive = true;
+#if defined(__linux__)
+  LinuxStartTicks(pid, &id.start_a);
+#  ifdef SYS_pidfd_open
+  long fd = ::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0);
+  if (fd >= 0) id.pidfd = static_cast<int>(fd);
+#  endif
+#elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+  FreebsdProc(pid, &id.start_a, &id.start_b, nullptr);
+#endif
+  return id;
+}
+
+void ReleaseProcIdentity(ProcIdentity* id) {
+  if (!id) return;
+  if (id->pidfd >= 0) {
+    ::close(id->pidfd);
+    id->pidfd = -1;
+  }
+}
+
+bool ProcIdentityStill(const ProcIdentity& id) {
+  if (!id.alive || id.pid == 0) return false;
+#if defined(__linux__)
+  if (id.pidfd >= 0) {
+#  ifdef SYS_pidfd_send_signal
+    if (::syscall(SYS_pidfd_send_signal, id.pidfd, 0, nullptr, 0) != 0 && errno != EPERM) {
+      return false;
+    }
+#  endif
+  }
+  if (id.start_a == 0) return ProcExists(id.pid);
+  uint64_t now = 0;
+  if (!LinuxStartTicks(id.pid, &now)) return false;
+  return now == id.start_a;
+#elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+  if (id.start_a == 0 && id.start_b == 0) return ProcExists(id.pid);
+  uint64_t sec = 0;
+  uint64_t usec = 0;
+  if (!FreebsdProc(id.pid, &sec, &usec, nullptr)) return false;
+  return sec == id.start_a && usec == id.start_b;
+#else
+  return ProcExists(id.pid);
+#endif
 }
 
 void SetMemTargetPid(uint32_t pid) { g_pid.store(pid); }

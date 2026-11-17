@@ -40,6 +40,9 @@ int main() {
   auto bare = llamaspy::ParseListenSpec("9100");
   CHECK(bare.ok && bare.host == "127.0.0.1" && bare.port == 9100);
 
+  auto bad_port = llamaspy::ParseListenSpec("127.0.0.1:abc");
+  CHECK(!bad_port.ok);
+
   auto eph = llamaspy::ParseListenSpec("127.0.0.1:0");
   CHECK(eph.ok && eph.port == 0);
   CHECK(llamaspy::ListenerPolicyError(eph, "k").empty());

@@ -2,11 +2,13 @@
 // FreeBSD DTrace pid provider). Spawns `bpftrace -p PID <generated.bt>` and
 // parses the same "ts n avg" lines into SnoopV1 frames. Read-only; no ptrace.
 // Requires root or CAP_BPF+CAP_PERFMON. Non-Linux builds get a stub.
+#include "llamaspy/proc_util.hpp"
 #include "llamaspy/telemetry_provider.hpp"
 #include "llamaspy/trace_parse.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -23,6 +25,18 @@
 namespace llamaspy {
 namespace {
 #if defined(__linux__)
+bool SafeUprobePath(const std::string& path) {
+  if (path.size() < 2 || path.size() > 400 || path[0] != '/') return false;
+  if (path.find("/../") != std::string::npos) return false;
+  if (path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0) return false;
+  for (unsigned char c : path) {
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '/' || c == '.' || c == '_' || c == '-' || c == '+';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 std::string FindTargetElf(uint32_t pid) {
   std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
   std::string line;
@@ -63,16 +77,34 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
     std::string s = ss.str();
     std::string target = FindTargetElf(pid_);
     if (target.empty()) { std::cerr << "[bpftrace-linux] cannot read /proc/" << pid_ << "\n"; return AttachStatus::NeedPrivileges; }
+    if (!SafeUprobePath(target)) {
+      std::cerr << "[bpftrace-linux] refusing target path with unsafe characters\n";
+      return AttachStatus::Failed;
+    }
     for (auto [k, v] : {std::pair<std::string, std::string>{"@TARGET@", target}, {"@PID@", std::to_string(pid_)}})
       for (size_t i; (i = s.find(k)) != std::string::npos;) s.replace(i, k.size(), v);
-    gen_ = "/tmp/llamaspy-" + std::to_string(getpid()) + ".bt";
-    { std::ofstream o(gen_); o << s; }
+    char dir_tmpl[] = "/tmp/llamaspy-XXXXXX";
+    char* made = ::mkdtemp(dir_tmpl);
+    if (!made) { std::cerr << "[bpftrace-linux] mkdtemp failed\n"; return AttachStatus::Failed; }
+    dir_ = made;
+    gen_ = dir_ + "/prog.bt";
+    int bfd = ::open(gen_.c_str(), O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_WRONLY, 0600);
+    if (bfd < 0) { std::cerr << "[bpftrace-linux] cannot create program file\n"; Detach(); return AttachStatus::Failed; }
+    size_t off = 0;
+    while (off < s.size()) {
+      ssize_t w = ::write(bfd, s.data() + off, s.size() - off);
+      if (w < 0) { ::close(bfd); Detach(); return AttachStatus::Failed; }
+      off += static_cast<size_t>(w);
+    }
+    ::close(bfd);
     std::cerr << "[bpftrace-linux] target " << target << "\n";
     int pipefd[2];
-    if (pipe(pipefd) != 0) return AttachStatus::Failed;
+    if (PipeCloexec(pipefd) != 0) return AttachStatus::Failed;
     child_ = fork();
-    if (child_ < 0) return AttachStatus::Failed;
+    if (child_ < 0) { close(pipefd[0]); close(pipefd[1]); return AttachStatus::Failed; }
     if (child_ == 0) {
+      ArmParentDeath(SIGTERM);
+      ::setpgid(0, 0);
       close(pipefd[0]); dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]);
       std::string p = std::to_string(pid_);
       execlp("bpftrace", "bpftrace", "-q", "-p", p.c_str(), gen_.c_str(), (char*)nullptr);
@@ -88,6 +120,10 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
     if (!attached_ || !fp_) return false;
     char line[512];
     if (!fgets(line, sizeof(line), fp_)) {
+      if (errno == EINTR) {
+        clearerr(fp_);
+        return true;
+      }
       int st = 0;
       if (child_ > 0 && waitpid(child_, &st, 0) > 0) {
         child_ = -1;
@@ -112,12 +148,14 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
   void Detach() override {
     attached_ = false;
     if (fp_) { fclose(fp_); fp_ = nullptr; }
-    if (child_ > 0) { kill(child_, SIGINT); waitpid(child_, nullptr, 0); child_ = -1; }
+    if (child_ > 0) { ReapChild(child_, SIGINT); child_ = -1; }
     if (!gen_.empty()) { unlink(gen_.c_str()); gen_.clear(); }
+    if (!dir_.empty()) { rmdir(dir_.c_str()); dir_.clear(); }
   }
   ~BpftraceLinuxProvider() override { Detach(); }
  private:
-  uint32_t pid_ = 0; pid_t child_ = -1; FILE* fp_ = nullptr; bool attached_ = false; std::string gen_;
+  uint32_t pid_ = 0; pid_t child_ = -1; FILE* fp_ = nullptr; bool attached_ = false;
+  std::string gen_; std::string dir_;
 };
 #else
 class BpftraceLinuxProvider final : public TelemetryProvider {

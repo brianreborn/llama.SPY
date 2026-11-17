@@ -23,12 +23,23 @@
 #include <sstream>
 #include <string>
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace {
 std::atomic<bool> g_run{true};
 void OnSignal(int) { g_run = false; }
+
+void InstallStopSignals() {
+  struct sigaction sa {};
+  sa.sa_handler = OnSignal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;  // no SA_RESTART: blocking reads return EINTR
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+  sigaction(SIGHUP, &sa, nullptr);
+}
 
 void Usage(const char* argv0) {
   std::cerr
@@ -38,7 +49,9 @@ void Usage(const char* argv0) {
       << "         [--slots-url URL] [--api-key KEY] [--log-file PATH]\n"
       << "         [--dtrace-script PATH] [--no-hud] [--hook-file PATH|-] [--gg-file PATH|-]\n"
       << "         [--list-tools] [--call-tool NAME [json-args]] [--from-url URL]\n"
-      << "         [--draft-out PATH] [--serve [127.0.0.1:9100]] [--api-key-file PATH]\n"
+      << "         [--draft-out PATH] [--draft-force] [--from-url-allow-http]\n"
+      << "         [--from-url-allow-private] [--serve [127.0.0.1:9100]]\n"
+      << "         [--listen-api-key KEY] [--listen-api-key-file PATH] [--api-key-file PATH]\n"
       << "         [--lang xx]\n"
       << "\n"
       << "  " << llamaspy::T("help.primary") << "\n"
@@ -58,7 +71,11 @@ void Usage(const char* argv0) {
       << "  --draft-out PATH: where --from-url writes the draft (default llamaspy-hook.draft.json)\n"
       << "\n"
       << "  " << llamaspy::T("help.serve") << "\n"
-      << "  --api-key-file PATH: API key for --serve, or Bearer for outbound HTTP\n"
+      << "  --api-key / --api-key-file: Bearer for outbound llama-server HTTP only.\n"
+      << "    Prefer --api-key-file (mode 0600, not a symlink). --api-key is visible in ps.\n"
+      << "  --listen-api-key / --listen-api-key-file: required for --serve. Not sent outbound.\n"
+      << "  --from-url is https and public hosts only, unless --from-url-allow-http\n"
+      << "    or --from-url-allow-private. --draft-force overwrites an existing draft.\n"
       << "  collector never binds the net; see docs/PRIVSEP.md.\n";
 }
 
@@ -194,8 +211,13 @@ int main(int argc, char** argv) {
   std::string from_url;
   std::string draft_out;
   std::string api_key_file;
+  std::string listen_api_key;
+  std::string listen_api_key_file;
   std::string serve_spec;
   bool want_serve = false;
+  bool draft_force = false;
+  bool from_url_allow_http = false;
+  bool from_url_allow_private = false;
   bool list_tools = false;
   std::string call_tool;
   std::string call_tool_args = "{}";
@@ -222,9 +244,12 @@ int main(int argc, char** argv) {
       want_metrics = true;
     } else if (a == "--api-key") {
       api_key = need("--api-key");
-      // auth alone does not imply attach; pairs with --metrics-url / --serve
     } else if (a == "--api-key-file") {
       api_key_file = need("--api-key-file");
+    } else if (a == "--listen-api-key") {
+      listen_api_key = need("--listen-api-key");
+    } else if (a == "--listen-api-key-file") {
+      listen_api_key_file = need("--listen-api-key-file");
     } else if (a == "--log-file") {
       log_file = need("--log-file");
       want_metrics = true;
@@ -256,6 +281,12 @@ int main(int argc, char** argv) {
       from_url = need("--from-url");
     } else if (a == "--draft-out") {
       draft_out = need("--draft-out");
+    } else if (a == "--draft-force") {
+      draft_force = true;
+    } else if (a == "--from-url-allow-http") {
+      from_url_allow_http = true;
+    } else if (a == "--from-url-allow-private") {
+      from_url_allow_private = true;
     } else if (a == "--lang") {
       llamaspy::I18nSetLang(need("--lang"));
     } else if (a == "--no-hud") {
@@ -276,22 +307,36 @@ int main(int argc, char** argv) {
     }
   }
 
+  auto load_key_file = [](const std::string& path, std::string* dest) {
+    std::string kerr;
+    std::string key = llamaspy::ReadApiKeyFile(path, &kerr);
+    if (key.empty()) {
+      std::cerr << "llama.SPY: " << kerr << "\n";
+      std::exit(2);
+    }
+    *dest = std::move(key);
+  };
   if (!api_key_file.empty()) {
     if (!api_key.empty()) {
       std::cerr << "llama.SPY: --api-key is set; ignoring --api-key-file\n";
     } else {
-      std::string kerr;
-      api_key = llamaspy::ReadApiKeyFile(api_key_file, &kerr);
-      if (api_key.empty()) {
-        std::cerr << "llama.SPY: " << kerr << "\n";
-        return 2;
-      }
+      load_key_file(api_key_file, &api_key);
+    }
+  }
+  if (!listen_api_key_file.empty()) {
+    if (!listen_api_key.empty()) {
+      std::cerr << "llama.SPY: --listen-api-key is set; ignoring --listen-api-key-file\n";
+    } else {
+      load_key_file(listen_api_key_file, &listen_api_key);
     }
   }
 
   // Fetch and write a draft. Never load it and never execute remote code.
   if (!from_url.empty()) {
-    auto drafted = llamaspy::WriteHookDraftFromUrl(from_url, draft_out);
+    llamaspy::UrlFetchOptions fopt;
+    fopt.allow_http = from_url_allow_http;
+    fopt.allow_private = from_url_allow_private;
+    auto drafted = llamaspy::WriteHookDraftFromUrl(from_url, draft_out, draft_force, fopt);
     if (!drafted.ok) {
       std::cerr << "llama.SPY: --from-url failed: " << drafted.error << "\n"
                 << "Remote content was not executed.\n";
@@ -410,10 +455,13 @@ int main(int argc, char** argv) {
     }
     llamaspy::ServeConfig cfg;
     cfg.listen = llamaspy::ParseListenSpec(serve_spec);
-    cfg.api_key = api_key;
+    cfg.api_key = listen_api_key;
     // Collector attaches first, then drops bind/listen/accept. Strict mode
     // (no new connect/open, Capsicum when available) is only for live tracers.
     return llamaspy::RunPrivsepServe(cfg, [&](int ipc) -> int {
+      InstallStopSignals();
+      int fl = ::fcntl(ipc, F_GETFL, 0);
+      if (fl >= 0) ::fcntl(ipc, F_SETFL, fl | O_NONBLOCK);
       auto st = AttachWithFallback(provider, backend, opts);
       if (st != llamaspy::AttachStatus::Ok) {
         std::cerr << "Attach failed via " << provider->name()
@@ -428,6 +476,7 @@ int main(int argc, char** argv) {
         bool cont = provider->StreamMetrics([&](const llamaspy::SnoopV1Frame& f) {
           llamaspy::SnoopV1Frame wire = llamaspy::snoop_hton(f);
           ssize_t n = ::send(ipc, &wire, sizeof(wire), MSG_NOSIGNAL);
+          if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
           if (n != static_cast<ssize_t>(sizeof(wire))) g_run = false;
         });
         if (!cont) break;
@@ -437,8 +486,7 @@ int main(int argc, char** argv) {
     });
   }
 
-  std::signal(SIGINT, OnSignal);
-  std::signal(SIGTERM, OnSignal);
+  InstallStopSignals();
 
   auto st = AttachWithFallback(provider, backend, opts);
   if (st != llamaspy::AttachStatus::Ok) {

@@ -1,6 +1,7 @@
 #include "llamaspy/from_url.hpp"
 
 #include "llamaspy/hook_script.hpp"
+#include "llamaspy/proc_util.hpp"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -139,7 +140,54 @@ std::string HeaderOf(const std::string& headers, const std::string& name) {
   return {};
 }
 
-bool HttpExchange(const std::string& url, HttpResp* out, std::string* err) {
+bool HostLooksPrivate(const std::string& host) {
+  std::string h = host;
+  for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (h == "localhost" || h == "localhost." || h == "::1" || h == "0.0.0.0") return true;
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  char tail = 0;
+  if (std::sscanf(h.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4) {
+    if (a > 255 || b > 255 || c > 255 || d > 255) return true;
+    if (a == 127 || a == 10 || a == 0) return true;
+    if (a == 169 && b == 254) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    return false;
+  }
+  return false;
+}
+
+bool SockaddrPrivate(const sockaddr* sa) {
+  if (!sa) return true;
+  if (sa->sa_family == AF_INET) {
+    uint32_t ip = ntohl(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
+    unsigned a = (ip >> 24) & 0xff;
+    unsigned b = (ip >> 16) & 0xff;
+    if (a == 127 || a == 10 || a == 0) return true;
+    if (a == 169 && b == 254) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    return false;
+  }
+  if (sa->sa_family == AF_INET6) {
+    const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+    if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) || IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr)) return true;
+    unsigned char b0 = in6->sin6_addr.s6_addr[0];
+    if ((b0 & 0xfe) == 0xfc) return true;
+    return false;
+  }
+  return true;
+}
+
+bool LocationSafe(const std::string& loc) {
+  if (loc.empty()) return false;
+  for (unsigned char c : loc) {
+    if (c < 0x20 || c == 0x7f) return false;
+  }
+  return loc.rfind("https://", 0) == 0 || loc.rfind("http://", 0) == 0;
+}
+
+bool HttpExchange(const std::string& url, HttpResp* out, std::string* err, bool allow_private) {
   UrlParts parts;
   if (!ParseHttpUrl(url, &parts)) {
     if (err) *err = "not an http URL";
@@ -150,12 +198,17 @@ bool HttpExchange(const std::string& url, HttpResp* out, std::string* err) {
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* res = nullptr;
   std::string port = std::to_string(parts.port);
+  if (HostLooksPrivate(parts.host) && !allow_private) {
+    if (err) *err = "refusing private or loopback host (pass --from-url-allow-private)";
+    return false;
+  }
   if (getaddrinfo(parts.host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
     if (err) *err = "DNS lookup failed for " + parts.host;
     return false;
   }
   int fd = -1;
   for (addrinfo* p = res; p; p = p->ai_next) {
+    if (SockaddrPrivate(p->ai_addr) && !allow_private) continue;
     fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
     if (fd < 0) continue;
     timeval tv{};
@@ -168,7 +221,8 @@ bool HttpExchange(const std::string& url, HttpResp* out, std::string* err) {
   }
   freeaddrinfo(res);
   if (fd < 0) {
-    if (err) *err = "connect failed for " + url;
+    if (err) *err = allow_private ? "connect failed for " + url
+                                  : "refusing private address or connect failed for " + url;
     return false;
   }
   std::ostringstream req;
@@ -242,22 +296,22 @@ std::string ReadPipeLimited(int fd, std::string* err) {
   return body;
 }
 
-std::string HttpsFetch(const std::string& url, std::string* err);
+std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt);
 
-std::string HttpFetch(const std::string& url, std::string* err) {
+std::string HttpFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
   std::string current = url;
   for (int hop = 0; hop < 3; ++hop) {
     HttpResp resp;
-    if (!HttpExchange(current, &resp, err)) return {};
+    if (!HttpExchange(current, &resp, err, opt.allow_private)) return {};
     if (resp.status >= 300 && resp.status < 400) {
       std::string loc = HeaderOf(resp.headers, "location");
-      if (loc.empty()) {
-        if (err) *err = "redirect with no Location";
+      if (!LocationSafe(loc)) {
+        if (err) *err = "refusing redirect Location (control character or bad scheme)";
         return {};
       }
-      if (loc.rfind("https://", 0) == 0) return HttpsFetch(loc, err);
-      if (loc.rfind("http://", 0) != 0) {
-        if (err) *err = "refusing non-http redirect";
+      if (loc.rfind("https://", 0) == 0) return HttpsFetch(loc, err, opt);
+      if (!opt.allow_http || loc.rfind("http://", 0) != 0) {
+        if (err) *err = "refusing non-https redirect";
         return {};
       }
       current = loc;
@@ -273,9 +327,30 @@ std::string HttpFetch(const std::string& url, std::string* err) {
   return {};
 }
 
-std::string HttpsFetch(const std::string& url, std::string* err) {
+std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
+  UrlParts parts;
+  const std::string prefix = "https://";
+  if (url.rfind(prefix, 0) != 0) {
+    if (err) *err = "not an https URL";
+    return {};
+  }
+  std::string rest = url.substr(prefix.size());
+  auto slash = rest.find('/');
+  std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
+  std::string host = hostport;
+  auto colon = hostport.rfind(':');
+  if (!hostport.empty() && hostport.front() == '[') {
+    auto rb = hostport.find(']');
+    if (rb != std::string::npos) host = hostport.substr(1, rb - 1);
+  } else if (colon != std::string::npos && hostport.find(':') == colon) {
+    host = hostport.substr(0, colon);
+  }
+  if ((HostLooksPrivate(host) || host.empty()) && !opt.allow_private) {
+    if (err) *err = "refusing private or loopback https host";
+    return {};
+  }
   int fds[2];
-  if (::pipe(fds) != 0) {
+  if (PipeCloexec(fds) != 0) {
     if (err) *err = "pipe failed";
     return {};
   }
@@ -297,8 +372,10 @@ std::string HttpsFetch(const std::string& url, std::string* err) {
       if (dn > 2) ::close(dn);
     }
     // argv only. Never a shell. curl is preferred; fetch is the FreeBSD client.
-    ::execlp("curl", "curl", "-fsSL", "--max-time", "20", "--proto", "=https", "--max-redirs",
-             "2", "-A", "llamaspy/0.2.0", "--", url.c_str(), static_cast<char*>(nullptr));
+    // -q ignores ~/.curlrc. --max-redirs 0 so a redirect cannot leave this host.
+    ::execlp("curl", "curl", "-q", "-fsSL", "--max-time", "20", "--proto", "=https",
+             "--max-redirs", "0", "-A", "llamaspy/0.2.0", "--", url.c_str(),
+             static_cast<char*>(nullptr));
     ::execlp("fetch", "fetch", "-q", "-T", "20", "-o", "-", url.c_str(),
              static_cast<char*>(nullptr));
     _exit(127);
@@ -319,15 +396,21 @@ std::string HttpsFetch(const std::string& url, std::string* err) {
   return body;
 }
 
-std::string FetchUrl(const std::string& url, std::string* err) {
+std::string FetchUrl(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
   if (url.find('\n') != std::string::npos || url.find('\r') != std::string::npos) {
     if (err) *err = "URL contains a newline";
     return {};
   }
-  if (url.rfind("https://", 0) == 0) return HttpsFetch(url, err);
-  if (url.rfind("http://", 0) == 0) return HttpFetch(url, err);
+  if (url.rfind("https://", 0) == 0) return HttpsFetch(url, err, opt);
+  if (url.rfind("http://", 0) == 0) {
+    if (!opt.allow_http) {
+      if (err) *err = "refusing plain http (pass --from-url-allow-http). https is the default.";
+      return {};
+    }
+    return HttpFetch(url, err, opt);
+  }
   if (err) {
-    *err = "only http:// and https:// are fetched. "
+    *err = "only https:// is fetched by default. "
            "file:, ftp:, and other schemes are refused. Nothing is executed.";
   }
   return {};
@@ -356,11 +439,12 @@ std::string RenderDraft(const HookScript& h, std::string_view source, const std:
     if (!t.description.empty()) o << ", \"description\": " << Quote(t.description);
     if (!t.handler.empty()) o << ", \"handler\": " << Quote(t.handler);
     if (!t.json_schema.empty() && t.json_schema != "{}") {
-      if (!t.json_schema.empty() && (t.json_schema.front() == '{' || t.json_schema.front() == '[')) {
-        o << ", \"json_schema\": " << t.json_schema;
-      } else {
-        o << ", \"json_schema\": " << Quote(t.json_schema);
+      // Always a JSON string. A raw object could smuggle a nested js_body.
+      std::string schema = t.json_schema;
+      if (schema.find("js_body") != std::string::npos || schema.find("\"script\"") != std::string::npos) {
+        schema = "{}";
       }
+      o << ", \"json_schema\": " << Quote(schema);
     }
     o << "}";
     if (i + 1 != h.tools.size()) o << ",";
@@ -461,10 +545,11 @@ std::string DraftHookScriptFromText(std::string_view body, std::string_view sour
   return RenderDraft(h, source_url, note);
 }
 
-DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string& out_path) {
+DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string& out_path,
+                                       bool overwrite, UrlFetchOptions opt) {
   DraftWriteResult r;
   std::string err;
-  std::string body = FetchUrl(url, &err);
+  std::string body = FetchUrl(url, &err, opt);
   if (body.empty()) {
     r.error = err.empty() ? "fetch failed" : err;
     return r;
@@ -477,20 +562,43 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
     return r;
   }
   std::string path = out_path.empty() ? "llamaspy-hook.draft.json" : out_path;
-  std::string tmp = path + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary);
-    if (!out) {
-      r.error = "cannot write " + tmp;
+  if (!overwrite) {
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0) {
+      r.error = "refusing to overwrite " + path + " (pass --draft-force)";
       return r;
     }
-    out << json;
-    if (!out) {
-      r.error = "write failed: " + tmp;
+  } else {
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) {
+      r.error = "refusing to replace symlink " + path;
       return r;
     }
   }
-  ::chmod(tmp.c_str(), 0644);
+  char tmpl[] = "/tmp/llamaspy-draft-XXXXXX";
+  int tfd = ::mkstemp(tmpl);
+  if (tfd < 0) {
+    r.error = "mkstemp failed";
+    return r;
+  }
+  std::string tmp = tmpl;
+  size_t off = 0;
+  bool write_ok = true;
+  while (off < json.size()) {
+    ssize_t n = ::write(tfd, json.data() + off, json.size() - off);
+    if (n < 0) {
+      write_ok = false;
+      break;
+    }
+    off += static_cast<size_t>(n);
+  }
+  ::fchmod(tfd, 0600);
+  ::close(tfd);
+  if (!write_ok) {
+    ::unlink(tmp.c_str());
+    r.error = "write failed";
+    return r;
+  }
   if (::rename(tmp.c_str(), path.c_str()) != 0) {
     r.error = "rename failed: " + path;
     ::unlink(tmp.c_str());
