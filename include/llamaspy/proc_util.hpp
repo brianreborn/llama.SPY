@@ -32,23 +32,17 @@ inline int PipeCloexec(int fds[2]) {
 }
 
 // Ask the kernel to signal us when our parent exits, then re-check.
-// If the parent already died, _exit so we do not keep a listen socket or a tracer.
-inline void ArmParentDeath(int sig) {
-  pid_t parent = ::getppid();
+// expected_ppid is the parent's pid captured before fork. If that process
+// is already gone, _exit so we do not keep a listen socket or a tracer.
+inline void ArmParentDeath(int sig, pid_t expected_ppid) {
 #if defined(__linux__)
-  if (::prctl(PR_SET_PDEATHSIG, sig) != 0) {
-    if (::getppid() != parent) _exit(1);
-    return;
-  }
+  ::prctl(PR_SET_PDEATHSIG, sig);
 #elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
-  if (::procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sig) != 0) {
-    if (::getppid() != parent) _exit(1);
-    return;
-  }
+  ::procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sig);
 #else
   (void)sig;
 #endif
-  if (::getppid() != parent) _exit(1);
+  if (expected_ppid > 0 && ::getppid() != expected_ppid) _exit(1);
 }
 
 // Polite signal, bounded wait, then SIGKILL. Also signals the child's

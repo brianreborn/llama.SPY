@@ -100,10 +100,11 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
     std::cerr << "[bpftrace-linux] target " << target << "\n";
     int pipefd[2];
     if (PipeCloexec(pipefd) != 0) return AttachStatus::Failed;
+    const pid_t self = ::getpid();
     child_ = fork();
     if (child_ < 0) { close(pipefd[0]); close(pipefd[1]); return AttachStatus::Failed; }
     if (child_ == 0) {
-      ArmParentDeath(SIGTERM);
+      ArmParentDeath(SIGTERM, self);
       ::setpgid(0, 0);
       close(pipefd[0]); dup2(pipefd[1], STDOUT_FILENO); close(pipefd[1]);
       std::string p = std::to_string(pid_);
@@ -119,8 +120,9 @@ class BpftraceLinuxProvider final : public TelemetryProvider {
   bool StreamMetrics(MetricsCallback cb) override {
     if (!attached_ || !fp_) return false;
     char line[512];
+    errno = 0;
     if (!fgets(line, sizeof(line), fp_)) {
-      if (errno == EINTR) {
+      if (ferror(fp_) && errno == EINTR) {
         clearerr(fp_);
         return true;
       }

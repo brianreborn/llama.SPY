@@ -385,7 +385,13 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
   std::string body = ReadPipeLimited(fds[0], err);
   ::close(fds[0]);
   int st = 0;
-  ::waitpid(c, &st, 0);
+  for (;;) {
+    pid_t w = ::waitpid(c, &st, 0);
+    if (w == c) break;
+    if (w < 0 && errno == EINTR) continue;
+    if (err) *err = "https fetch wait failed";
+    return {};
+  }
   if (WIFEXITED(st) && WEXITSTATUS(st) == 127) {
     if (err) *err = "https fetch needs curl or fetch on PATH; remote code is not executed";
     return {};
@@ -563,26 +569,24 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
     return r;
   }
   std::string path = out_path.empty() ? "llamaspy-hook.draft.json" : out_path;
-  if (!overwrite) {
-    struct stat st {};
-    if (::lstat(path.c_str(), &st) == 0) {
-      r.error = "refusing to overwrite " + path + " (pass --draft-force)";
-      return r;
-    }
-  } else {
-    struct stat st {};
-    if (::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) {
-      r.error = "refusing to replace symlink " + path;
-      return r;
-    }
-  }
-  char tmpl[] = "/tmp/llamaspy-draft-XXXXXX";
-  int tfd = ::mkstemp(tmpl);
-  if (tfd < 0) {
-    r.error = "mkstemp failed";
+  struct stat lst {};
+  if (::lstat(path.c_str(), &lst) == 0 && S_ISLNK(lst.st_mode)) {
+    r.error = "refusing to replace symlink " + path;
     return r;
   }
-  std::string tmp = tmpl;
+  std::string dir = ".";
+  auto slash = path.find_last_of('/');
+  if (slash == 0) dir = "/";
+  else if (slash != std::string::npos) dir = path.substr(0, slash);
+  std::string pattern = dir + "/llamaspy-draft-XXXXXX";
+  std::vector<char> tmpl(pattern.begin(), pattern.end());
+  tmpl.push_back('\0');
+  int tfd = ::mkstemp(tmpl.data());
+  if (tfd < 0) {
+    r.error = "mkstemp failed in " + dir;
+    return r;
+  }
+  std::string tmp(tmpl.data());
   size_t off = 0;
   bool write_ok = true;
   while (off < json.size()) {
@@ -600,7 +604,16 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
     r.error = "write failed";
     return r;
   }
-  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+  if (!overwrite) {
+    if (::link(tmp.c_str(), path.c_str()) != 0) {
+      int e = errno;
+      ::unlink(tmp.c_str());
+      if (e == EEXIST) r.error = "refusing to overwrite " + path + " (pass --draft-force)";
+      else r.error = std::string("could not publish draft: ") + std::strerror(e);
+      return r;
+    }
+    ::unlink(tmp.c_str());
+  } else if (::rename(tmp.c_str(), path.c_str()) != 0) {
     r.error = "rename failed: " + path;
     ::unlink(tmp.c_str());
     return r;

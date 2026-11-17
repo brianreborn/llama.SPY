@@ -73,7 +73,8 @@ void Usage(const char* argv0) {
       << "  " << llamaspy::T("help.serve") << "\n"
       << "  --api-key / --api-key-file: Bearer for outbound llama-server HTTP only.\n"
       << "    Prefer --api-key-file (mode 0600, not a symlink). --api-key is visible in ps.\n"
-      << "  --listen-api-key / --listen-api-key-file: required for --serve. Not sent outbound.\n"
+      << "  --listen-api-key-file PATH: required for --serve (mode 0600, not a symlink).\n"
+      << "    --listen-api-key is visible in ps. Neither is sent outbound.\n"
       << "  --from-url is https and public hosts only, unless --from-url-allow-http\n"
       << "    or --from-url-allow-private. --draft-force overwrites an existing draft.\n"
       << "  collector never binds the net; see docs/PRIVSEP.md.\n";

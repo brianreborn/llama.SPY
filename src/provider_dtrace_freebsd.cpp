@@ -46,6 +46,7 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
     // TODO: prefer libdtrace embedding for tighter SnoopV1 integration.
     int pipefd[2];
     if (PipeCloexec(pipefd) != 0) return AttachStatus::Failed;
+    const pid_t self = ::getpid();
     child_ = fork();
     if (child_ < 0) {
       close(pipefd[0]);
@@ -53,7 +54,7 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       return AttachStatus::Failed;
     }
     if (child_ == 0) {
-      ArmParentDeath(SIGTERM);
+      ArmParentDeath(SIGTERM, self);
       ::setpgid(0, 0);
       close(pipefd[0]);
       dup2(pipefd[1], STDOUT_FILENO);
@@ -78,8 +79,9 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
   bool StreamMetrics(MetricsCallback cb) override {
     if (!attached_ || !fp_) return false;
     char line[512];
+    errno = 0;
     if (!fgets(line, sizeof(line), fp_)) {
-      if (errno == EINTR) {
+      if (ferror(fp_) && errno == EINTR) {
         clearerr(fp_);
         return true;
       }

@@ -132,11 +132,12 @@ add_test(NAME serve_policy COMMAND test_serve)
 add_test(NAME from_url COMMAND test_from_url)
 add_test(NAME trace_parse COMMAND test_trace_parse)
 add_test(NAME cli_serve COMMAND sh ${CMAKE_SOURCE_DIR}/tests/cli_serve_test.sh $<TARGET_FILE:llamaspy>)
+add_test(NAME serve_longevity COMMAND sh ${CMAKE_SOURCE_DIR}/tests/serve_longevity_test.sh $<TARGET_FILE:llamaspy>)
 add_test(NAME no_target_writes COMMAND sh ${CMAKE_SOURCE_DIR}/tests/no_target_writes.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME hook_smoke COMMAND sh ${CMAKE_SOURCE_DIR}/bin/run-hook-smoke.sh)
 add_test(NAME tracer_cleanup COMMAND sh ${CMAKE_SOURCE_DIR}/tests/tracer_cleanup_test.sh
          $<TARGET_FILE:llamaspy> ${CMAKE_SOURCE_DIR})
 add_test(NAME gen_gg_offsets COMMAND sh ${CMAKE_SOURCE_DIR}/tests/gen_gg_offsets_test.sh
          $<TARGET_FILE:test_mem_read> ${CMAKE_SOURCE_DIR}/scripts/gen-gg-offsets.sh)
-set_tests_properties(mem_read serve_policy from_url trace_parse cli_serve no_target_writes hook_smoke gen_gg_offsets tracer_cleanup
+set_tests_properties(mem_read serve_policy from_url trace_parse cli_serve no_target_writes hook_smoke gen_gg_offsets tracer_cleanup serve_longevity
                      PROPERTIES TIMEOUT 60)

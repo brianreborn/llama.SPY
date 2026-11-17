@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -618,9 +619,8 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
       saw_attach_stop = true;
       break;
     }
-    // A stop that is not our attach SIGSTOP is a signal the target must keep.
-    if (sig > 0 && pending_sig == 0) pending_sig = sig;
-    if (::ptrace(PT_CONTINUE, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), 0) != 0) {
+    // Deliver this signal now so a second, different stop is not dropped.
+    if (::ptrace(PT_CONTINUE, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), sig) != 0) {
       if (err) *err = std::string("ptrace PT_CONTINUE while waiting for SIGSTOP: ") + ErrnoText();
       DetachPtrace(pid, pending_sig, nullptr);
       restore();
@@ -700,6 +700,7 @@ std::vector<MapRange> MapsFromProc(uint32_t pid, int proc_dir, std::string* err)
 std::string CaptureCommand(const char* file, const char* const argv[]) {
   int fds[2];
   if (PipeCloexec(fds) != 0) return {};
+  const pid_t self = ::getpid();
   pid_t c = ::fork();
   if (c < 0) {
     ::close(fds[0]);
@@ -707,7 +708,7 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
     return {};
   }
   if (c == 0) {
-    ArmParentDeath(SIGTERM);
+    ArmParentDeath(SIGTERM, self);
     ::dup2(fds[1], STDOUT_FILENO);
     ::close(fds[0]);
     ::close(fds[1]);
@@ -727,8 +728,21 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
   for (;;) {
     timespec now {};
     ::clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed = (now.tv_sec - start.tv_sec);
-    if (elapsed > 3) {
+    long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+    int remain = static_cast<int>(3000 - elapsed_ms);
+    if (remain <= 0) {
+      ::kill(c, SIGKILL);
+      break;
+    }
+    pollfd pfd {};
+    pfd.fd = fds[0];
+    pfd.events = POLLIN;
+    int pr = ::poll(&pfd, 1, remain);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) {
       ::kill(c, SIGKILL);
       break;
     }

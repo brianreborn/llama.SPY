@@ -627,23 +627,14 @@ std::atomic<int> g_coll{-1};
 std::atomic<int> g_serve_pid{-1};
 volatile sig_atomic_t g_stop = 0;
 
+void OnChild(int) {}
+
 void OnStop(int) {
   g_stop = 1;
   int c = g_coll.load(std::memory_order_relaxed);
   int s = g_serve_pid.load(std::memory_order_relaxed);
   if (c > 0) ::kill(c, SIGTERM);
   if (s > 0) ::kill(s, SIGTERM);
-}
-
-void ForgetPid(std::atomic<int>& slot) {
-  sigset_t block, old;
-  sigemptyset(&block);
-  sigaddset(&block, SIGINT);
-  sigaddset(&block, SIGTERM);
-  sigaddset(&block, SIGHUP);
-  ::sigprocmask(SIG_BLOCK, &block, &old);
-  slot.store(-1, std::memory_order_relaxed);
-  ::sigprocmask(SIG_SETMASK, &old, nullptr);
 }
 
 int ChildStatus(int st) {
@@ -656,6 +647,14 @@ int ChildStatus(int st) {
 }
 
 int Reap(pid_t coll, pid_t serve) {
+  sigset_t block, old;
+  sigemptyset(&block);
+  sigaddset(&block, SIGINT);
+  sigaddset(&block, SIGTERM);
+  sigaddset(&block, SIGHUP);
+  sigaddset(&block, SIGCHLD);
+  ::sigprocmask(SIG_BLOCK, &block, &old);
+
   g_coll.store(static_cast<int>(coll), std::memory_order_relaxed);
   g_serve_pid.store(static_cast<int>(serve), std::memory_order_relaxed);
 
@@ -664,43 +663,56 @@ int Reap(pid_t coll, pid_t serve) {
   int code_c = 0;
   int code_s = 0;
   bool escalated = false;
-  long deadline = MonoMs() + 3000;
-  const long give_up = MonoMs() + 8000;
+  long deadline = 0;  // 0 means steady state: do not kill live children
   while (!got_c || !got_s) {
-    if (MonoMs() > give_up) break;
     int st = 0;
     pid_t p = ::waitpid(-1, &st, WNOHANG);
-    if (p < 0) {
-      if (errno == EINTR) continue;
-      if (errno == ECHILD) break;
-    } else if (p > 0) {
+    if (p > 0) {
       if (p == coll && !got_c) {
         got_c = true;
         code_c = ChildStatus(st);
-        ForgetPid(g_coll);
-        if (!got_s) ::kill(serve, SIGTERM);
-        deadline = MonoMs() + 3000;
+        g_coll.store(-1, std::memory_order_relaxed);
+        if (!got_s) {
+          ::kill(serve, SIGTERM);
+          deadline = MonoMs() + 5000;
+        }
       } else if (p == serve && !got_s) {
         got_s = true;
         code_s = ChildStatus(st);
-        ForgetPid(g_serve_pid);
-        if (!got_c) ::kill(coll, SIGTERM);
-        deadline = MonoMs() + 3000;
+        g_serve_pid.store(-1, std::memory_order_relaxed);
+        if (!got_c) {
+          ::kill(coll, SIGTERM);
+          deadline = MonoMs() + 5000;
+        }
       }
       continue;
     }
-    if (MonoMs() > deadline && !escalated) {
-      if (!got_c) ::kill(coll, SIGKILL);
-      if (!got_s) ::kill(serve, SIGKILL);
-      escalated = true;
-      deadline = MonoMs() + 2000;
+    if (p < 0 && errno == ECHILD) break;
+    if (g_stop && deadline == 0) deadline = MonoMs() + 5000;
+    if (deadline != 0 && MonoMs() > deadline) {
+      if (!escalated) {
+        if (!got_c) ::kill(coll, SIGKILL);
+        if (!got_s) ::kill(serve, SIGKILL);
+        escalated = true;
+        deadline = MonoMs() + 2000;
+      } else {
+        break;
+      }
     }
-    timespec ts{};
-    ts.tv_nsec = 50000000L;
-    ::nanosleep(&ts, nullptr);
+    if (deadline == 0) {
+      // Signals unblocked only for the wait. The handler runs, then the mask returns.
+      ::sigsuspend(&old);
+    } else {
+      ::sigprocmask(SIG_SETMASK, &old, nullptr);
+      timespec ts{};
+      ts.tv_nsec = 50000000L;
+      ::nanosleep(&ts, nullptr);
+      ::sigprocmask(SIG_BLOCK, &block, nullptr);
+    }
   }
-  ForgetPid(g_coll);
-  ForgetPid(g_serve_pid);
+  g_coll.store(-1, std::memory_order_relaxed);
+  g_serve_pid.store(-1, std::memory_order_relaxed);
+  ::sigprocmask(SIG_SETMASK, &old, nullptr);
   if (g_stop) return 0;
   if (!got_c || !got_s) return 1;
   if (code_s != 0) return code_s;
@@ -793,7 +805,7 @@ std::string ListenerPolicyError(const ListenSpec& spec, const std::string& api_k
   }
   if (blank) {
     o << "refusing to listen: network listeners require an API key "
-         "(--api-key or --api-key-file). "
+         "(--listen-api-key or --listen-api-key-file). "
          "This applies to every listener, including 127.0.0.1. "
          "0.0.0.0 without a key is refused.\n";
   } else if (key.find('\n') != std::string::npos || key.find('\r') != std::string::npos ||
@@ -865,12 +877,13 @@ void SandboxCollector(int ipc_fd, bool strict) {
 #endif
 }
 
-void PrepareChild() {
+void PrepareChild(pid_t expected_ppid) {
   ::signal(SIGINT, SIG_DFL);
   ::signal(SIGTERM, SIG_DFL);
   ::signal(SIGHUP, SIG_DFL);
+  ::signal(SIGCHLD, SIG_DFL);
   ::signal(SIGPIPE, SIG_IGN);
-  ArmParentDeath(SIGTERM);
+  ArmParentDeath(SIGTERM, expected_ppid);
 }
 
 int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>& collector) {
@@ -893,6 +906,11 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
   ::sigaction(SIGINT, &sa, nullptr);
   ::sigaction(SIGTERM, &sa, nullptr);
   ::sigaction(SIGHUP, &sa, nullptr);
+  struct sigaction chld {};
+  chld.sa_handler = OnChild;
+  sigemptyset(&chld.sa_mask);
+  chld.sa_flags = 0;
+  ::sigaction(SIGCHLD, &chld, nullptr);
 
   int sv[2] = {-1, -1};
   if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0) {
@@ -903,6 +921,7 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
     }
   }
   std::fflush(nullptr);
+  const pid_t self = ::getpid();
   pid_t coll = ::fork();
   if (coll < 0) {
     std::cerr << "llama.SPY: fork collector failed\n";
@@ -913,7 +932,7 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
   }
   if (coll == 0) {
     ::close(sv[1]);
-    PrepareChild();
+    PrepareChild(self);
     ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     ScrubFds(sv[0]);
     char line[128];
@@ -944,7 +963,7 @@ int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>
   }
   if (serve == 0) {
     ::close(sv[0]);
-    PrepareChild();
+    PrepareChild(self);
     ::sigprocmask(SIG_SETMASK, &oldset, nullptr);
     ScrubFds(sv[1]);
     int rc = ServeChild(sv[1], cfg);
