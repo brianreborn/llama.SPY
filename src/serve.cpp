@@ -988,7 +988,8 @@ std::string ReadApiKeyFile(const std::string& path, std::string* err) {
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0) {
     if (err) {
-      if (errno == ELOOP) *err = "API key file is a symlink; refusing: " + path;
+      // Linux O_NOFOLLOW returns ELOOP. FreeBSD returns EMLINK.
+      if (errno == ELOOP || errno == EMLINK) *err = "API key file is a symlink; refusing: " + path;
       else *err = "cannot open API key file: " + path;
     }
     return {};
