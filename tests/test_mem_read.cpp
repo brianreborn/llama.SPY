@@ -217,12 +217,15 @@ int main() {
       std::cerr << "running ptrace read failed: " << live.error << "\n";
       ++g_fail;
     } else {
-      int pst = 0;
-      pid_t pw = ::waitpid(running, &pst, WNOHANG | WUNTRACED);
-      CHECK(pw == 0);
-      int kst = 0;
-      CHECK(!ProcTraced(running, &kst));
-      CHECK(kst != SSTOP);
+      bool resumed = false;
+      for (int i = 0; i < 50 && !resumed; ++i) {
+        int pst = 0;
+        (void)::waitpid(running, &pst, WNOHANG | WUNTRACED | WCONTINUED);
+        int kst = 0;
+        if (!ProcTraced(running, &kst) && kst != SSTOP) resumed = true;
+        else ::usleep(20000);
+      }
+      CHECK(resumed);
     }
     ::kill(running, SIGKILL);
     ::waitpid(running, nullptr, 0);

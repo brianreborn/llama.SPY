@@ -582,7 +582,13 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
 
   bool was_stopped = false;
   int kstat = 0;
-  if (FreebsdProc(pid, nullptr, nullptr, &kstat)) was_stopped = (kstat == SSTOP);
+  long flags_before = 0;
+  if (FreebsdProc(pid, nullptr, nullptr, &kstat, &flags_before)) {
+    was_stopped = (kstat == SSTOP);
+#ifdef P_STOPPED_SIG
+    if ((flags_before & P_STOPPED_SIG) != 0) was_stopped = true;
+#endif
+  }
 
   if (::ptrace(PT_ATTACH, static_cast<pid_t>(pid), nullptr, 0) != 0) {
     int e = errno;
@@ -654,15 +660,8 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
     restore();
     return false;
   }
-  long flags = 0;
-  int st_after = 0;
-  if (FreebsdProc(pid, nullptr, nullptr, &st_after, &flags)) {
-#ifdef P_STOPPED_SIG
-    was_stopped = (flags & P_STOPPED_SIG) != 0;
-#else
-    (void)st_after;
-#endif
-  }
+  // Do not resample P_STOPPED_SIG here. PT_ATTACH's own SIGSTOP sets it,
+  // so a running target would be detached with SIGSTOP and left stopped.
 
   struct ptrace_io_desc iod {};
   iod.piod_op = PIOD_READ_D;
