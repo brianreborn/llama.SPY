@@ -1373,43 +1373,25 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
   }
   bool in_own = false;
   bool in_foreign = false;
-  bool in_anon = false;
   for (const auto& rg : all_maps) {
     if (!(addr >= rg.start && addr_end <= rg.end)) continue;
-    if (rg.path.empty()) {
-      in_anon = true;
-      continue;
-    }
+    if (rg.path.empty()) continue;
     if (chosen && NormalizeModulePath(rg.path) == chosen->path) in_own = true;
     else in_foreign = true;
   }
   bool in_elf = false;
-  uint64_t slack = 0;
   if (chosen && chosen->bias_ok) {
     for (const auto& ld : chosen->elf.loads) {
       uint64_t lo = 0;
       uint64_t hi = 0;
       uint64_t span = ld.memsz != 0 ? ld.memsz : ld.filesz;
-      if (ld.memsz > ld.filesz) {
-        uint64_t extra = ld.memsz - ld.filesz;
-        if (extra > (1ull << 20)) extra = 1ull << 20;
-        slack = std::max(slack, extra);
-      }
       if (!add_u64(chosen->bias, ld.vaddr, &lo) || !add_u64(lo, span, &hi)) continue;
       if (addr >= lo && addr_end <= hi) in_elf = true;
     }
   }
-  uint64_t own_hi = 0;
-  if (chosen) {
-    for (const auto& rg : chosen->ranges)
-      if (rg.end > own_hi) own_hi = rg.end;
-  }
-  uint64_t near_hi = 0;
-  const bool near = chosen && add_u64(own_hi, slack, &near_hi) && addr_end <= near_hi;
-  // Named mapping of this module, or the ELF image only within 1 MiB past
-  // that mapping (BSS). A large p_memsz must not cover the heap.
-  (void)in_anon;
-  const bool in_map = !in_foreign && (in_own || (in_elf && near));
+  // A named mapping of this module, or the ELF image when it is not inside
+  // some other file. FreeBSD BSS often has no path in the vm map.
+  const bool in_map = !in_foreign && (in_own || in_elf);
   if (!in_map) {
     std::ostringstream o;
     o << "resolved address is outside the module mappings";

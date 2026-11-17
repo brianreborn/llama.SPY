@@ -183,15 +183,15 @@ int main() {
     ++g_fail;
   } else {
     CHECK(via_ptr.raw_bits == kChildU64);
+    bool still_stopped = false;
+    for (int i = 0; i < 50 && !still_stopped; ++i) {
+      int pst = 0;
+      pid_t pw = ::waitpid(child, &pst, WNOHANG | WUNTRACED);
+      if (pw == child && WIFSTOPPED(pst)) still_stopped = true;
+      else ::usleep(20000);
+    }
+    CHECK(still_stopped);
   }
-  bool still_stopped = false;
-  for (int i = 0; i < 50 && !still_stopped; ++i) {
-    int pst = 0;
-    pid_t pw = ::waitpid(child, &pst, WNOHANG | WUNTRACED);
-    if (pw == child && WIFSTOPPED(pst)) still_stopped = true;
-    else ::usleep(20000);
-  }
-  CHECK(still_stopped);
 #endif
 
   auto u32 = Binding("llamaspy_test_u32", 0, llamaspy::GgValueType::U32, fp);
