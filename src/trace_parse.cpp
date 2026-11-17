@@ -1,4 +1,5 @@
 #include "llamaspy/trace_parse.hpp"
+#include "llamaspy/proc_util.hpp"
 
 #include <cctype>
 #include <cstdlib>
@@ -50,25 +51,9 @@ bool BpftraceOnPath() {
 #if defined(_WIN32)
   return false;
 #else
-  const char* path = std::getenv("PATH");
-  if (!path || !*path) return false;
-  std::string dir;
-  const char* p = path;
-  auto check = [](const std::string& d) {
-    if (d.empty()) return false;
-    std::string full = d + "/bpftrace";
-    return ::access(full.c_str(), X_OK) == 0;
-  };
-  while (*p) {
-    if (*p == ':') {
-      if (check(dir)) return true;
-      dir.clear();
-    } else {
-      dir.push_back(*p);
-    }
-    ++p;
-  }
-  return check(dir);
+  const char* over = std::getenv("LLAMASPY_BPFTRACE");
+  if (over && *over && ::access(over, X_OK) == 0) return true;
+  return !ResolveTrusted("bpftrace").empty();
 #endif
 }
 

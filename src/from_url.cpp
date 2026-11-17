@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -95,6 +96,49 @@ struct UrlParts {
   std::string path = "/";
 };
 
+bool AuthorityOk(const std::string& hostport) {
+  for (unsigned char c : hostport) {
+    if (c == '@' || c == '\\' || c == '?' || c == '#' || c <= 0x20 || c == 0x7f) return false;
+  }
+  return !hostport.empty();
+}
+
+bool ParsePort(const char* text, int* port) {
+  if (!text || !*text) return false;
+  char* end = nullptr;
+  errno = 0;
+  long v = std::strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || v <= 0 || v > 65535) return false;
+  *port = static_cast<int>(v);
+  return true;
+}
+
+bool SplitAuthority(const std::string& hostport, int default_port, UrlParts* out) {
+  if (!AuthorityOk(hostport)) return false;
+  if (hostport.front() == '[') {
+    auto rb = hostport.find(']');
+    if (rb == std::string::npos) return false;
+    out->host = hostport.substr(1, rb - 1);
+    if (out->host.empty() || !AuthorityOk(out->host)) return false;
+    if (rb + 1 < hostport.size()) {
+      if (hostport[rb + 1] != ':') return false;
+      if (!ParsePort(hostport.c_str() + rb + 2, &out->port)) return false;
+    } else {
+      out->port = default_port;
+    }
+  } else {
+    auto colon = hostport.rfind(':');
+    if (colon == std::string::npos) {
+      out->host = hostport;
+      out->port = default_port;
+    } else {
+      out->host = hostport.substr(0, colon);
+      if (!ParsePort(hostport.c_str() + colon + 1, &out->port)) return false;
+    }
+  }
+  return !out->host.empty();
+}
+
 bool ParseHttpUrl(const std::string& url, UrlParts* out) {
   const std::string prefix = "http://";
   if (url.rfind(prefix, 0) != 0) return false;
@@ -102,27 +146,7 @@ bool ParseHttpUrl(const std::string& url, UrlParts* out) {
   auto slash = rest.find('/');
   std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
   out->path = slash == std::string::npos ? "/" : rest.substr(slash);
-  if (hostport.empty()) return false;
-  if (hostport.front() == '[') {
-    auto rb = hostport.find(']');
-    if (rb == std::string::npos) return false;
-    out->host = hostport.substr(1, rb - 1);
-    if (rb + 1 < hostport.size() && hostport[rb + 1] == ':') {
-      out->port = std::atoi(hostport.c_str() + rb + 2);
-    } else {
-      out->port = 80;
-    }
-  } else {
-    auto colon = hostport.rfind(':');
-    if (colon == std::string::npos) {
-      out->host = hostport;
-      out->port = 80;
-    } else {
-      out->host = hostport.substr(0, colon);
-      out->port = std::atoi(hostport.c_str() + colon + 1);
-    }
-  }
-  return !out->host.empty() && out->port > 0 && out->port <= 65535;
+  return SplitAuthority(hostport, 80, out);
 }
 
 struct HttpResp {
@@ -184,6 +208,23 @@ bool SockaddrBlocked(const sockaddr* sa) {
 #endif
     unsigned char b0 = a.s6_addr[0];
     if ((b0 & 0xfe) == 0xfc) return true;
+    // NAT64 64:ff9b::/96 and 6to4 2002::/16 carry an embedded IPv4 address.
+    bool nat64 = a.s6_addr[0] == 0x00 && a.s6_addr[1] == 0x64 && a.s6_addr[2] == 0xff &&
+                 a.s6_addr[3] == 0x9b;
+    if (nat64) {
+      for (int i = 4; i < 12; ++i)
+        if (a.s6_addr[i] != 0) nat64 = false;
+    }
+    if (nat64) {
+      uint32_t v4 = 0;
+      std::memcpy(&v4, a.s6_addr + 12, 4);
+      return Ipv4Blocked(ntohl(v4));
+    }
+    if (a.s6_addr[0] == 0x20 && a.s6_addr[1] == 0x02) {
+      uint32_t v4 = 0;
+      std::memcpy(&v4, a.s6_addr + 2, 4);
+      return Ipv4Blocked(ntohl(v4));
+    }
     bool v4compat = true;
     for (int i = 0; i < 12; ++i) {
       if (a.s6_addr[i] != 0) v4compat = false;
@@ -367,7 +408,17 @@ bool HttpExchange(const std::string& url, HttpResp* out, std::string* err, bool 
   }
   std::string raw;
   char buf[4096];
+  timespec t0 {};
+  ::clock_gettime(CLOCK_MONOTONIC, &t0);
   while (raw.size() <= kMaxBody + 8192) {
+    timespec now {};
+    ::clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
+    if (elapsed_ms > 20000) {
+      ::close(fd);
+      if (err) *err = "http read timed out";
+      return false;
+    }
     ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n < 0) {
       if (errno == EINTR) continue;
@@ -457,33 +508,16 @@ bool ParseSchemeUrl(const std::string& url, const char* scheme, int default_port
   auto slash = rest.find('/');
   std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
   out->path = slash == std::string::npos ? "/" : rest.substr(slash);
-  if (hostport.empty()) return false;
-  if (hostport.front() == '[') {
-    auto rb = hostport.find(']');
-    if (rb == std::string::npos) return false;
-    out->host = hostport.substr(1, rb - 1);
-    if (rb + 1 < hostport.size() && hostport[rb + 1] == ':') {
-      out->port = std::atoi(hostport.c_str() + rb + 2);
-    } else {
-      out->port = default_port;
-    }
-  } else {
-    auto colon = hostport.rfind(':');
-    if (colon == std::string::npos) {
-      out->host = hostport;
-      out->port = default_port;
-    } else {
-      out->host = hostport.substr(0, colon);
-      out->port = std::atoi(hostport.c_str() + colon + 1);
-    }
-  }
-  return !out->host.empty() && out->port > 0 && out->port <= 65535;
+  return SplitAuthority(hostport, default_port, out);
 }
 
 std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
   UrlParts parts;
   if (!ParseSchemeUrl(url, "https://", 443, &parts)) {
-    if (err) *err = "not an https URL";
+    if (err) {
+      *err = url.rfind("https://", 0) == 0 ? "refusing URL authority"
+                                           : "not an https URL";
+    }
     return {};
   }
   std::vector<ResolvedAddr> addrs;
@@ -496,6 +530,7 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
     else pinned += addrs[i].ip;
   }
   std::string resolve_spec = resolve_host + ":" + std::to_string(parts.port) + ":" + pinned;
+  std::string curl_url = "https://" + resolve_host + ":" + std::to_string(parts.port) + parts.path;
   int fds[2];
   if (PipeCloexec(fds) != 0) {
     if (err) *err = "pipe failed";
@@ -520,15 +555,23 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
     }
     // argv only. Never a shell. --resolve pins the addresses we already checked
     // so curl cannot resolve the name again. -q ignores ~/.curlrc.
+    ::unsetenv("http_proxy");
+    ::unsetenv("https_proxy");
+    ::unsetenv("HTTP_PROXY");
+    ::unsetenv("HTTPS_PROXY");
+    ::unsetenv("ALL_PROXY");
+    ::unsetenv("all_proxy");
+    std::string curl = ResolveTrusted("curl");
+    if (curl.empty()) _exit(127);
     std::vector<std::string> args = {
-        "curl", "-q", "-fsSL", "--max-time", "20", "--proto", "=https",
+        curl, "-q", "-fsSL", "--noproxy", "*", "--max-time", "20", "--proto", "=https",
         "--max-redirs", "0", "-A", "llamaspy/0.2.0", "--resolve", resolve_spec,
-        "--", url};
+        "--", curl_url};
     std::vector<char*> av;
     av.reserve(args.size() + 1);
     for (auto& s : args) av.push_back(s.data());
     av.push_back(nullptr);
-    ::execvp(av[0], av.data());
+    ::execv(av[0], av.data());
     _exit(127);
   }
   ::close(fds[1]);

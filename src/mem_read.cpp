@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+#  include <sys/sysmacros.h>
 #  include <sys/uio.h>
 extern "C" ssize_t process_vm_readv(pid_t pid, const struct iovec* local_iov,
                                      unsigned long liovcnt,
@@ -282,7 +283,9 @@ ElfView ParseElf(const FdReader& rd) {
       }
     }
   }
-  if (shentsize < 64 || shnum > 10000 || shoff == 0) {
+  // ELF64 section headers are 64 bytes. A larger shentsize would allocate
+  // hundreds of megabytes (shnum is only capped at 10000).
+  if (shentsize != 64 || shnum > 10000 || shoff == 0) {
     ev.ok = true;
     return ev;
   }
@@ -723,7 +726,9 @@ std::string CaptureCommand(const char* file, const char* const argv[]) {
       ::dup2(devnull, STDERR_FILENO);
       ::close(devnull);
     }
-    ::execvp(file, const_cast<char* const*>(argv));
+    std::string bin = ResolveTrusted(file);
+    if (bin.empty()) _exit(127);
+    ::execv(bin.c_str(), const_cast<char* const*>(argv));
     _exit(127);
   }
   ::close(fds[1]);
@@ -883,22 +888,46 @@ int OpenModuleFd(int proc_dir, const std::string& path, const std::string& exe_p
     char rel[96];
     std::snprintf(rel, sizeof(rel), "map_files/%lx-%lx", static_cast<unsigned long>(low),
                   static_cast<unsigned long>(end));
-    int mapped = ::openat(proc_dir, rel, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    // map_files entries are magic symlinks. O_NOFOLLOW would always fail.
+    int mapped = ::openat(proc_dir, rel, O_RDONLY | O_CLOEXEC);
     if (mapped >= 0) return mapped;
   }
+  uint64_t maj = 0, minr = 0, ino = 0;
+  bool check = false;
+  for (const auto& r : ranges) {
+    if (r.has_dev && r.has_inode) {
+      maj = r.dev_major;
+      minr = r.dev_minor;
+      ino = r.inode;
+      check = true;
+      break;
+    }
+  }
+  auto accept = [&](int fd) {
+    if (fd < 0) return -1;
+    if (!check) return fd;
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || static_cast<uint64_t>(st.st_ino) != ino ||
+        static_cast<uint64_t>(major(st.st_dev)) != maj ||
+        static_cast<uint64_t>(minor(st.st_dev)) != minr) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  };
   if (proc_dir >= 0 && !path.empty() && path[0] == '/') {
     int root = ::openat(proc_dir, "root", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (root >= 0) {
-      int fd = ::openat(root, path.c_str() + 1, O_RDONLY | O_CLOEXEC);
+      int fd = accept(::openat(root, path.c_str() + 1, O_RDONLY | O_CLOEXEC));
       ::close(root);
       if (fd >= 0) return fd;
     }
     if (!exe_path.empty() && path == exe_path) {
-      int exe = ::openat(proc_dir, "exe", O_RDONLY | O_CLOEXEC);
+      int exe = accept(::openat(proc_dir, "exe", O_RDONLY | O_CLOEXEC));
       if (exe >= 0) return exe;
     }
   }
-  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  return accept(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
 }
 
 std::vector<ModuleImage> LoadModules(uint32_t pid, int proc_dir, std::string* err,
@@ -1077,6 +1106,21 @@ std::vector<MapRange> ParseLinuxMapsText(std::string_view text) {
     if (!ParseHex(address.substr(dash + 1), &r.end)) continue;
     r.perms = perms;
     if (ParseHex(offset, &r.file_offset)) r.has_file_offset = true;
+    auto colon = dev.find(':');
+    if (colon != std::string::npos) {
+      uint64_t maj = 0, minr = 0;
+      if (ParseHex(dev.substr(0, colon), &maj) && ParseHex(dev.substr(colon + 1), &minr)) {
+        r.dev_major = maj;
+        r.dev_minor = minr;
+        r.has_dev = true;
+      }
+    }
+    char* end = nullptr;
+    unsigned long long ino = std::strtoull(inode.c_str(), &end, 10);
+    if (end && end != inode.c_str() && *end == '\0') {
+      r.inode = static_cast<uint64_t>(ino);
+      r.has_inode = true;
+    }
     std::string path;
     std::getline(iss, path);
     path = Trim(path);
@@ -1329,36 +1373,47 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
   }
   bool in_own = false;
   bool in_foreign = false;
+  bool in_anon = false;
   for (const auto& rg : all_maps) {
     if (!(addr >= rg.start && addr_end <= rg.end)) continue;
-    if (rg.path.empty()) continue;
+    if (rg.path.empty()) {
+      in_anon = true;
+      continue;
+    }
     if (chosen && NormalizeModulePath(rg.path) == chosen->path) in_own = true;
     else in_foreign = true;
   }
   bool in_elf = false;
+  uint64_t slack = 0;
   if (chosen && chosen->bias_ok) {
     for (const auto& ld : chosen->elf.loads) {
       uint64_t lo = 0;
       uint64_t hi = 0;
       uint64_t span = ld.memsz != 0 ? ld.memsz : ld.filesz;
+      if (ld.memsz > ld.filesz) {
+        uint64_t extra = ld.memsz - ld.filesz;
+        if (extra > (1ull << 20)) extra = 1ull << 20;
+        slack = std::max(slack, extra);
+      }
       if (!add_u64(chosen->bias, ld.vaddr, &lo) || !add_u64(lo, span, &hi)) continue;
       if (addr >= lo && addr_end <= hi) in_elf = true;
     }
   }
-  // A file mapping of this module is enough. BSS on FreeBSD is often missing
-  // from the named vm list, so an address inside this ELF image is also
-  // accepted when it does not fall in some other file.
-  const bool in_map = !in_foreign && (in_own || in_elf);
+  uint64_t own_hi = 0;
+  if (chosen) {
+    for (const auto& rg : chosen->ranges)
+      if (rg.end > own_hi) own_hi = rg.end;
+  }
+  uint64_t near_hi = 0;
+  const bool near = chosen && add_u64(own_hi, slack, &near_hi) && addr_end <= near_hi;
+  // Named mapping of this module, or the ELF image only within 1 MiB past
+  // that mapping (BSS). A large p_memsz must not cover the heap.
+  (void)in_anon;
+  const bool in_map = !in_foreign && (in_own || (in_elf && near));
   if (!in_map) {
     std::ostringstream o;
-    o << "resolved address 0x" << std::hex << addr << "..0x" << addr_end
-      << " is outside the module mappings";
-    if (chosen) {
-      o << " path=" << chosen->path;
-      for (const auto& rg : chosen->ranges) {
-        o << " [0x" << rg.start << ",0x" << rg.end << ")";
-      }
-    }
+    o << "resolved address is outside the module mappings";
+    if (chosen) o << " for " << chosen->path;
     r.status = MemStatus::ReadError;
     r.error = o.str();
     return r;
@@ -1454,11 +1509,14 @@ bool LinuxExeStamp(uint32_t pid, uint64_t* dev, uint64_t* ino, uint64_t* map_sta
   std::ifstream in("/proc/" + std::to_string(pid) + "/maps");
   std::string line;
   while (std::getline(in, line)) {
-    if (line.find(exe) == std::string::npos) continue;
-    auto dash = line.find('-');
+    std::istringstream iss(line);
+    std::string addr, perms, off, dev, inode, path;
+    if (!(iss >> addr >> perms >> off >> dev >> inode >> path)) continue;
+    if (NormalizeModulePath(path) != exe) continue;
+    auto dash = addr.find('-');
     if (dash == std::string::npos) continue;
     uint64_t start = 0;
-    if (!ParseHex(line.substr(0, dash), &start)) continue;
+    if (!ParseHex(addr.substr(0, dash), &start)) continue;
     if (*map_start == 0 || start < *map_start) *map_start = start;
   }
   return true;

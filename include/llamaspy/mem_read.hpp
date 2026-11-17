@@ -38,6 +38,11 @@ struct MapRange {
   uint64_t end = 0;
   uint64_t file_offset = 0;
   bool has_file_offset = false;
+  bool has_dev = false;
+  bool has_inode = false;
+  uint64_t dev_major = 0;
+  uint64_t dev_minor = 0;
+  uint64_t inode = 0;
   std::string perms;
   std::string path;
 };

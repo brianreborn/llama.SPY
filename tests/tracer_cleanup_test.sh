@@ -30,7 +30,7 @@ chmod 700 "$TMP/bin/bpftrace"
 
 start_spy() {
   rm -f "$TMP/tracer.pid" "$TMP/out"
-  PATH="$TMP/bin:$PATH" "$BIN" --serve 127.0.0.1:0 --listen-api-key test-key \
+  LLAMASPY_BPFTRACE="$TMP/bin/bpftrace" "$BIN" --serve 127.0.0.1:0 --listen-api-key test-key \
     --backend bpftrace --pid "$SP" --dtrace-script "$ROOT/scripts/llama_decode.d" \
     --no-hud >"$TMP/out" 2>&1 &
   PID=$!

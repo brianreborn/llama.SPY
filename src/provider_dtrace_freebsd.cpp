@@ -60,8 +60,11 @@ class DtraceFreeBsdProvider final : public TelemetryProvider {
       dup2(pipefd[1], STDOUT_FILENO);
       close(pipefd[1]);
       std::string pid_s = std::to_string(pid_);
-      execlp("dtrace", "dtrace", "-p", pid_s.c_str(), "-s", script_.c_str(),
-             static_cast<char*>(nullptr));
+      const char* over = std::getenv("LLAMASPY_DTRACE");
+      std::string bin = (over && *over) ? std::string(over) : ResolveTrusted("dtrace");
+      if (!bin.empty())
+        execl(bin.c_str(), "dtrace", "-p", pid_s.c_str(), "-s", script_.c_str(),
+              static_cast<char*>(nullptr));
       _exit(127);
     }
     close(pipefd[1]);

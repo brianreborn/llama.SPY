@@ -175,7 +175,9 @@ bool DenyBindFamily(bool strict) {
   size_t n = 0;
   nrs[n++] = SYS_bind;
   nrs[n++] = SYS_listen;
+#  ifdef SYS_accept
   nrs[n++] = SYS_accept;
+#  endif
 #  ifdef SYS_accept4
   nrs[n++] = SYS_accept4;
 #  endif
@@ -301,9 +303,15 @@ bool AllowServeSyscalls() {
   add(SYS_read);
   add(SYS_write);
   add(SYS_close);
+#  ifdef SYS_fstat
   add(SYS_fstat);
+#  endif
+#  ifdef SYS_poll
   add(SYS_poll);
+#  endif
+#  ifdef SYS_lseek
   add(SYS_lseek);
+#  endif
   add(SYS_mmap);
   add(SYS_mprotect);
   add(SYS_munmap);
@@ -316,10 +324,14 @@ bool AllowServeSyscalls() {
   add(SYS_writev);
   add(SYS_mremap);
   add(SYS_madvise);
+#  ifdef SYS_dup
   add(SYS_dup);
+#  endif
   add(SYS_nanosleep);
   add(SYS_getpid);
+#  ifdef SYS_accept
   add(SYS_accept);
+#  endif
   add(SYS_sendto);
   add(SYS_recvfrom);
   add(SYS_shutdown);
@@ -367,13 +379,8 @@ bool AllowServeSyscalls() {
 #  ifdef SYS_recvmsg
   add(SYS_recvmsg);
 #  endif
-#  ifdef SYS_pread64
-  add(SYS_pread64);
-#  endif
-#  ifdef SYS_pwrite64
-  add(SYS_pwrite64);
-#  endif
-  // Not allowed: socket, connect, bind, listen, execve, ptrace, process_vm_*.
+  // Not allowed: socket, connect, bind, listen, execve, ptrace, process_vm_*,
+  // pread64, pwrite64. poll is ppoll where SYS_poll does not exist.
   return InstallSeccompAllow(nrs, n);
 }
 #endif  // __linux__
@@ -523,7 +530,10 @@ void PrintBound(int fd) {
 
 std::string HeaderValue(const std::string& req, const std::string& name) {
   std::string want = Lower(name);
-  size_t pos = 0;
+  // Skip the request line. A colon in the URL must not look like a header.
+  size_t pos = req.find("\r\n");
+  if (pos == std::string::npos) return {};
+  pos += 2;
   while (pos < req.size()) {
     size_t eol = req.find("\r\n", pos);
     if (eol == std::string::npos) eol = req.size();

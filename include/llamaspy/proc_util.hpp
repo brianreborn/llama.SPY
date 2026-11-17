@@ -4,7 +4,9 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstring>
 #include <ctime>
+#include <string>
 
 #include <fcntl.h>
 #include <sys/types.h>
@@ -19,6 +21,19 @@
 #endif
 
 namespace llamaspy {
+
+// Absolute path under a fixed directory. An empty result means "not found";
+// callers must not fall back to PATH.
+inline std::string ResolveTrusted(const char* name) {
+  if (!name || !*name) return {};
+  if (std::strchr(name, '/') != nullptr) return name;
+  const char* dirs[] = {"/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"};
+  for (const char* d : dirs) {
+    std::string p = std::string(d) + "/" + name;
+    if (::access(p.c_str(), X_OK) == 0) return p;
+  }
+  return {};
+}
 
 inline int PipeCloexec(int fds[2]) {
 #if defined(__linux__) || defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
