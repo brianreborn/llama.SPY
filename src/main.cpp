@@ -245,10 +245,14 @@ int main(int argc, char** argv) {
       want_metrics = true;
     } else if (a == "--api-key") {
       api_key = need("--api-key");
+      volatile char* wipe = argv[i];
+      while (wipe && *wipe) *wipe++ = ' ';
     } else if (a == "--api-key-file") {
       api_key_file = need("--api-key-file");
     } else if (a == "--listen-api-key") {
       listen_api_key = need("--listen-api-key");
+      volatile char* wipe = argv[i];
+      while (wipe && *wipe) *wipe++ = ' ';
     } else if (a == "--listen-api-key-file") {
       listen_api_key_file = need("--listen-api-key-file");
     } else if (a == "--log-file") {

@@ -788,13 +788,17 @@ std::vector<MapRange> MapsFromSysctl(uint32_t pid, std::string* err) {
       kinfo_vmentry kv {};
       size_t copy = static_cast<size_t>(sz) < sizeof(kv) ? static_cast<size_t>(sz) : sizeof(kv);
       std::memcpy(&kv, buf.data() + off, copy);
-      if (kv.kve_path[0] == '/' && kv.kve_end > kv.kve_start) {
+      if (kv.kve_end > kv.kve_start) {
         MapRange r;
         r.start = kv.kve_start;
         r.end = kv.kve_end;
-        r.file_offset = kv.kve_offset;
-        r.has_file_offset = true;
-        r.path = kv.kve_path;
+        // Anonymous mappings (BSS, guard) have an empty path. Keep them so a
+        // symbol in the file's memsz can still be checked against a real map.
+        if (kv.kve_path[0] == '/') {
+          r.file_offset = kv.kve_offset;
+          r.has_file_offset = true;
+          r.path = kv.kve_path;
+        }
         out.push_back(std::move(r));
       }
     }
@@ -891,8 +895,10 @@ int OpenModuleFd(int proc_dir, const std::string& path, const std::string& exe_p
   return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
 }
 
-std::vector<ModuleImage> LoadModules(uint32_t pid, int proc_dir, std::string* err) {
+std::vector<ModuleImage> LoadModules(uint32_t pid, int proc_dir, std::string* err,
+                                     std::vector<MapRange>* all_maps) {
   auto ranges = MapsForPid(pid, proc_dir, err);
+  if (all_maps) *all_maps = ranges;
   std::vector<std::string> order;
   std::vector<std::vector<MapRange>> groups;
   for (const auto& r : ranges) {
@@ -1208,7 +1214,8 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     return r;
   }
   std::string map_err;
-  auto mods = LoadModules(pid, guard.dir, &map_err);
+  std::vector<MapRange> all_maps;
+  auto mods = LoadModules(pid, guard.dir, &map_err, &all_maps);
   if (!ProcIdentityStill(id)) {
     r.status = MemStatus::NoSuchProcess;
     r.error = "pid " + std::to_string(pid) + " exited or was reused during lookup";
@@ -1232,7 +1239,9 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
       candidates.push_back(&m);
     }
   }
-  if (!constrained && saw_any_id && candidates.empty()) {
+  // One unfingerprinted mapping must not reopen every module. If any mapped
+  // image has a build-id, an empty fp is a mismatch.
+  if (!constrained && saw_any_id) {
     r.status = MemStatus::FingerprintMismatch;
     r.error = "binding has no fp=buildid but a mapped module has a GNU build-id; refusing to read";
     return r;
@@ -1249,10 +1258,6 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     if (!saw_any_id) o << " (no GNU build-id found; regenerate with scripts/gen-gg-offsets.sh)";
     r.error = o.str();
     return r;
-  }
-  if (!constrained) {
-    candidates.clear();
-    for (auto& m : mods) candidates.push_back(&m);
   }
 
   ModuleImage* chosen = nullptr;
@@ -1316,15 +1321,28 @@ BindingRead ReadBinding(uint32_t pid, const GgBinding& binding, MemBackend backe
     r.error = "read range overflow";
     return r;
   }
-  bool in_map = false;
-  if (chosen) {
-    for (const auto& rg : chosen->ranges) {
-      if (addr >= rg.start && addr_end <= rg.end) {
-        in_map = true;
-        break;
-      }
+  bool in_own = false;
+  bool in_foreign = false;
+  for (const auto& rg : all_maps) {
+    if (!(addr >= rg.start && addr_end <= rg.end)) continue;
+    if (rg.path.empty()) continue;
+    if (chosen && NormalizeModulePath(rg.path) == chosen->path) in_own = true;
+    else in_foreign = true;
+  }
+  bool in_elf = false;
+  if (chosen && chosen->bias_ok) {
+    for (const auto& ld : chosen->elf.loads) {
+      uint64_t lo = 0;
+      uint64_t hi = 0;
+      uint64_t span = ld.memsz != 0 ? ld.memsz : ld.filesz;
+      if (!add_u64(chosen->bias, ld.vaddr, &lo) || !add_u64(lo, span, &hi)) continue;
+      if (addr >= lo && addr_end <= hi) in_elf = true;
     }
   }
+  // A file mapping of this module is enough. BSS on FreeBSD is often missing
+  // from the named vm list, so an address inside this ELF image is also
+  // accepted when it does not fall in some other file.
+  const bool in_map = !in_foreign && (in_own || in_elf);
   if (!in_map) {
     std::ostringstream o;
     o << "resolved address 0x" << std::hex << addr << "..0x" << addr_end
@@ -1414,6 +1432,76 @@ std::string BindingReadJson(const BindingRead& r) {
   return o.str();
 }
 
+#if defined(__linux__)
+bool LinuxExeStamp(uint32_t pid, uint64_t* dev, uint64_t* ino, uint64_t* map_start) {
+  std::string link = "/proc/" + std::to_string(pid) + "/exe";
+  struct stat st {};
+  if (::stat(link.c_str(), &st) != 0) return false;
+  *dev = static_cast<uint64_t>(st.st_dev);
+  *ino = st.st_ino;
+  *map_start = 0;
+  char pathbuf[4096];
+  ssize_t n = ::readlink(link.c_str(), pathbuf, sizeof(pathbuf) - 1);
+  if (n <= 0) return true;
+  pathbuf[n] = 0;
+  std::string exe = NormalizeModulePath(pathbuf);
+  std::ifstream in("/proc/" + std::to_string(pid) + "/maps");
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.find(exe) == std::string::npos) continue;
+    auto dash = line.find('-');
+    if (dash == std::string::npos) continue;
+    uint64_t start = 0;
+    if (!ParseHex(line.substr(0, dash), &start)) continue;
+    if (*map_start == 0 || start < *map_start) *map_start = start;
+  }
+  return true;
+}
+#endif
+
+#if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+bool FreebsdTextStamp(uint32_t pid, uint64_t* fileid, uint64_t* fsid, uint64_t* map_start) {
+  *fileid = 0;
+  *fsid = 0;
+  *map_start = 0;
+  char path[4096];
+  size_t plen = sizeof(path);
+  int pmib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, static_cast<int>(pid)};
+  if (::sysctl(pmib, 4, path, &plen, nullptr, 0) == 0 && path[0] == '/') {
+    auto maps = MapsFromSysctl(pid, nullptr);
+    std::string exe = NormalizeModulePath(path);
+    for (const auto& r : maps) {
+      if (NormalizeModulePath(r.path) != exe) continue;
+      if (*map_start == 0 || r.start < *map_start) *map_start = r.start;
+    }
+  }
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_FILEDESC, static_cast<int>(pid)};
+  size_t len = 0;
+  if (::sysctl(mib, 4, nullptr, &len, nullptr, 0) != 0 || len == 0) return *map_start != 0;
+  std::vector<unsigned char> buf(len + 128);
+  size_t cap = buf.size();
+  if (::sysctl(mib, 4, buf.data(), &cap, nullptr, 0) != 0) return *map_start != 0;
+  size_t off = 0;
+  while (off + sizeof(int) <= cap) {
+    int sz = 0;
+    std::memcpy(&sz, buf.data() + off, sizeof(sz));
+    if (sz <= 0 || off + static_cast<size_t>(sz) > cap) break;
+    if (static_cast<size_t>(sz) >= sizeof(int) * 4) {
+      kinfo_file kf {};
+      size_t copy = static_cast<size_t>(sz) < sizeof(kf) ? static_cast<size_t>(sz) : sizeof(kf);
+      std::memcpy(&kf, buf.data() + off, copy);
+      if (kf.kf_fd == KF_FD_TYPE_TEXT && kf.kf_type == KF_TYPE_VNODE) {
+        *fileid = kf.kf_file.kf_file_fileid;
+        *fsid = kf.kf_file.kf_file_fsid;
+        return true;
+      }
+    }
+    off += static_cast<size_t>(sz);
+  }
+  return *map_start != 0 || *fileid != 0;
+}
+#endif
+
 ProcIdentity CaptureProcIdentity(uint32_t pid) {
   ProcIdentity id;
   id.pid = pid;
@@ -1425,8 +1513,10 @@ ProcIdentity CaptureProcIdentity(uint32_t pid) {
   long fd = ::syscall(SYS_pidfd_open, static_cast<pid_t>(pid), 0);
   if (fd >= 0) id.pidfd = static_cast<int>(fd);
 #  endif
+  id.have_exe = LinuxExeStamp(pid, &id.exe_dev, &id.exe_ino, &id.exe_map);
 #elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
   FreebsdProc(pid, &id.start_a, &id.start_b, nullptr);
+  id.have_exe = FreebsdTextStamp(pid, &id.exe_ino, &id.exe_dev, &id.exe_map);
 #endif
   return id;
 }
@@ -1449,16 +1539,30 @@ bool ProcIdentityStill(const ProcIdentity& id) {
     }
 #  endif
   }
-  if (id.start_a == 0) return ProcExists(id.pid);
+  if (id.start_a == 0) return false;
   uint64_t now = 0;
-  if (!LinuxStartTicks(id.pid, &now)) return false;
-  return now == id.start_a;
+  if (!LinuxStartTicks(id.pid, &now) || now != id.start_a) return false;
+  if (id.have_exe) {
+    uint64_t dev = 0, ino = 0, map = 0;
+    if (!LinuxExeStamp(id.pid, &dev, &ino, &map)) return false;
+    if (dev != id.exe_dev || ino != id.exe_ino) return false;
+    if (id.exe_map != 0 && map != id.exe_map) return false;
+  }
+  return true;
 #elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
-  if (id.start_a == 0 && id.start_b == 0) return ProcExists(id.pid);
+  if (id.start_a == 0 && id.start_b == 0) return false;
   uint64_t sec = 0;
   uint64_t usec = 0;
   if (!FreebsdProc(id.pid, &sec, &usec, nullptr)) return false;
-  return sec == id.start_a && usec == id.start_b;
+  if (sec != id.start_a || usec != id.start_b) return false;
+  if (id.have_exe) {
+    uint64_t fileid = 0, fsid = 0, map = 0;
+    if (!FreebsdTextStamp(id.pid, &fileid, &fsid, &map)) return false;
+    if (id.exe_ino != 0 && fileid != id.exe_ino) return false;
+    if (id.exe_dev != 0 && fsid != id.exe_dev) return false;
+    if (id.exe_map != 0 && map != id.exe_map) return false;
+  }
+  return true;
 #else
   return ProcExists(id.pid);
 #endif

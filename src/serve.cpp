@@ -140,6 +140,16 @@ bool InstallSeccompDeny(const int* nrs, size_t count) {
 #  endif
   prog.push_back(Sf(BPF_LD | BPF_W | BPF_ABS,
                     0, 0, static_cast<uint32_t>(offsetof(struct seccomp_data, nr))));
+#  if defined(__x86_64__)
+  // x32 uses the native arch with bit 30 set on some kernels, and
+  // AUDIT_ARCH_X32 on others. The arch check covers the second. This covers the first.
+  prog.push_back(Sf(BPF_JMP | BPF_JSET | BPF_K, 0, 1, 0x40000000u));
+#    ifdef SECCOMP_RET_KILL_PROCESS
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS));
+#    else
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL));
+#    endif
+#  endif
   for (size_t i = 0; i < count; ++i) {
     prog.push_back(Sf(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, static_cast<uint32_t>(nrs[i])));
     prog.push_back(Sf(BPF_RET | BPF_K, 0, 0,
@@ -189,13 +199,19 @@ bool DenyBindFamily(bool strict) {
   return InstallSeccompDeny(nrs, n);
 }
 
-void TryLandlock() {
+bool TryLandlock() {
+  // landlock_restrict_self requires no_new_privs. Set it first or the call
+  // returns EPERM and the process used to keep serving unsandboxed.
+  if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    std::cerr << "llama.SPY serve: PR_SET_NO_NEW_PRIVS failed: " << std::strerror(errno) << "\n";
+    return false;
+  }
 #  if defined(LANDLOCK_ACCESS_FS_READ_FILE) && defined(SYS_landlock_create_ruleset)
   int abi = static_cast<int>(::syscall(SYS_landlock_create_ruleset, nullptr, 0,
                                        LANDLOCK_CREATE_RULESET_VERSION));
   if (abi < 1) {
     std::cerr << "llama.SPY serve: landlock unavailable (" << std::strerror(errno) << ")\n";
-    return;
+    return false;
   }
   landlock_ruleset_attr attr{};
   attr.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE |
@@ -214,37 +230,151 @@ void TryLandlock() {
   int fd = static_cast<int>(::syscall(SYS_landlock_create_ruleset, &attr, sizeof(attr), 0));
   if (fd < 0) {
     std::cerr << "llama.SPY serve: landlock ruleset failed: " << std::strerror(errno) << "\n";
-    return;
+    return false;
   }
   if (::syscall(SYS_landlock_restrict_self, fd, 0) != 0) {
     std::cerr << "llama.SPY serve: landlock restrict failed: " << std::strerror(errno) << "\n";
-  } else {
-    std::cerr << "llama.SPY serve: landlock (no filesystem access)\n";
+    ::close(fd);
+    return false;
   }
   ::close(fd);
+  std::cerr << "llama.SPY serve: landlock (no filesystem access)\n";
+  return true;
+#  else
+  std::cerr << "llama.SPY serve: landlock headers missing\n";
+  return false;
 #  endif
 }
 
-bool DenyServeSyscalls() {
-  int nrs[12];
+bool InstallSeccompAllow(const int* nrs, size_t count) {
+#  if defined(__x86_64__)
+  const uint32_t arch = AUDIT_ARCH_X86_64;
+#  elif defined(__aarch64__)
+  const uint32_t arch = AUDIT_ARCH_AARCH64;
+#  elif defined(__i386__)
+  const uint32_t arch = AUDIT_ARCH_I386;
+#  else
+  std::cerr << "llama.SPY: seccomp refused on this architecture\n";
+  return false;
+#  endif
+  std::vector<sock_filter> prog;
+  prog.push_back(Sf(BPF_LD | BPF_W | BPF_ABS,
+                    0, 0, static_cast<uint32_t>(offsetof(struct seccomp_data, arch))));
+  prog.push_back(Sf(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, arch));
+#  ifdef SECCOMP_RET_KILL_PROCESS
+  const uint32_t kill = SECCOMP_RET_KILL_PROCESS;
+#  else
+  const uint32_t kill = SECCOMP_RET_KILL;
+#  endif
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, kill));
+  prog.push_back(Sf(BPF_LD | BPF_W | BPF_ABS,
+                    0, 0, static_cast<uint32_t>(offsetof(struct seccomp_data, nr))));
+#  if defined(__x86_64__)
+  prog.push_back(Sf(BPF_JMP | BPF_JSET | BPF_K, 0, 1, 0x40000000u));
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, kill));
+#  endif
+  for (size_t i = 0; i < count; ++i) {
+    prog.push_back(Sf(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, static_cast<uint32_t>(nrs[i])));
+    prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW));
+  }
+  prog.push_back(Sf(BPF_RET | BPF_K, 0, 0, kill));
+  if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+    std::cerr << "llama.SPY: PR_SET_NO_NEW_PRIVS failed: " << std::strerror(errno) << "\n";
+    return false;
+  }
+  sock_fprog fp{};
+  fp.len = static_cast<unsigned short>(prog.size());
+  fp.filter = prog.data();
+  if (::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fp) != 0) {
+    std::cerr << "llama.SPY: seccomp install failed: " << std::strerror(errno) << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool AllowServeSyscalls() {
+  int nrs[96];
   size_t n = 0;
-  nrs[n++] = SYS_bind;
-  nrs[n++] = SYS_listen;
-  nrs[n++] = SYS_connect;
-  nrs[n++] = SYS_execve;
-#  ifdef SYS_execveat
-  nrs[n++] = SYS_execveat;
+  auto add = [&](int nr) {
+    if (n < sizeof(nrs) / sizeof(nrs[0])) nrs[n++] = nr;
+  };
+  add(SYS_read);
+  add(SYS_write);
+  add(SYS_close);
+  add(SYS_fstat);
+  add(SYS_poll);
+  add(SYS_lseek);
+  add(SYS_mmap);
+  add(SYS_mprotect);
+  add(SYS_munmap);
+  add(SYS_brk);
+  add(SYS_rt_sigaction);
+  add(SYS_rt_sigprocmask);
+  add(SYS_rt_sigreturn);
+  add(SYS_ioctl);
+  add(SYS_readv);
+  add(SYS_writev);
+  add(SYS_mremap);
+  add(SYS_madvise);
+  add(SYS_dup);
+  add(SYS_nanosleep);
+  add(SYS_getpid);
+  add(SYS_accept);
+  add(SYS_sendto);
+  add(SYS_recvfrom);
+  add(SYS_shutdown);
+  add(SYS_getsockname);
+  add(SYS_getpeername);
+  add(SYS_setsockopt);
+  add(SYS_getsockopt);
+  add(SYS_exit);
+  add(SYS_fcntl);
+  add(SYS_gettimeofday);
+  add(SYS_futex);
+  add(SYS_exit_group);
+  add(SYS_clock_gettime);
+  add(SYS_restart_syscall);
+#  ifdef SYS_accept4
+  add(SYS_accept4);
 #  endif
-#  ifdef SYS_ptrace
-  nrs[n++] = SYS_ptrace;
+#  ifdef SYS_ppoll
+  add(SYS_ppoll);
 #  endif
-#  ifdef SYS_process_vm_readv
-  nrs[n++] = SYS_process_vm_readv;
+#  ifdef SYS_pselect6
+  add(SYS_pselect6);
 #  endif
-#  ifdef SYS_process_vm_writev
-  nrs[n++] = SYS_process_vm_writev;
+#  ifdef SYS_newfstatat
+  add(SYS_newfstatat);
 #  endif
-  return InstallSeccompDeny(nrs, n);
+#  ifdef SYS_clock_nanosleep
+  add(SYS_clock_nanosleep);
+#  endif
+#  ifdef SYS_gettid
+  add(SYS_gettid);
+#  endif
+#  ifdef SYS_getrandom
+  add(SYS_getrandom);
+#  endif
+#  ifdef SYS_rseq
+  add(SYS_rseq);
+#  endif
+#  ifdef SYS_dup3
+  add(SYS_dup3);
+#  endif
+#  ifdef SYS_sendmsg
+  add(SYS_sendmsg);
+#  endif
+#  ifdef SYS_recvmsg
+  add(SYS_recvmsg);
+#  endif
+#  ifdef SYS_pread64
+  add(SYS_pread64);
+#  endif
+#  ifdef SYS_pwrite64
+  add(SYS_pwrite64);
+#  endif
+  // Not allowed: socket, connect, bind, listen, execve, ptrace, process_vm_*.
+  return InstallSeccompAllow(nrs, n);
 }
 #endif  // __linux__
 
@@ -486,24 +616,7 @@ long MonoMs() {
   return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-void HandleClient(int fd, const std::string& key, const SnoopV1Frame* frame) {
-  const long deadline = MonoMs() + 2000;
-  timeval tv{};
-  tv.tv_sec = 2;
-  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-  std::string raw;
-  char buf[1024];
-  while (raw.size() < 8192 && raw.find("\r\n\r\n") == std::string::npos) {
-    if (MonoMs() > deadline) break;
-    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    if (n == 0) break;
-    raw.append(buf, static_cast<size_t>(n));
-  }
+void HandleClient(int fd, const std::string& raw, const std::string& key, const SnoopV1Frame* frame) {
   if (raw.find("\r\n\r\n") == std::string::npos) {
     SendResponse(fd, 400, "Bad Request", "bad request\n", "text/plain", false);
     return;
@@ -556,8 +669,8 @@ int ServeChild(int ipc, const ServeConfig& cfg) {
   std::cerr << "llama.SPY serve pid=" << ::getpid() << "\n";
   DropToNobody();
 #if defined(__linux__)
-  TryLandlock();
-  if (!DenyServeSyscalls()) _exit(1);
+  if (!TryLandlock()) _exit(1);
+  if (!AllowServeSyscalls()) _exit(1);
 #endif
 #if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
   CapsicumServe(ipc, lfd);
@@ -571,15 +684,31 @@ int ServeChild(int ipc, const ServeConfig& cfg) {
   SnoopV1Frame latest{};
   bool have = false;
   std::string acc;
-  for (;;) {
-    pollfd pf[2];
-    pf[0].fd = ipc;
-    pf[0].events = POLLIN;
-    pf[0].revents = 0;
-    pf[1].fd = lfd;
-    pf[1].events = POLLIN;
-    pf[1].revents = 0;
-    int pr = ::poll(pf, 2, 1000);
+  struct Pending {
+    int fd = -1;
+    long deadline = 0;
+    std::string raw;
+  };
+  std::vector<Pending> clients;
+  constexpr size_t kMaxClients = 8;
+  bool ipc_dead = false;
+  while (!ipc_dead) {
+    long now = MonoMs();
+    for (size_t i = 0; i < clients.size();) {
+      if (now > clients[i].deadline) {
+        SendResponse(clients[i].fd, 408, "Request Timeout", "timeout\n", "text/plain", false);
+        ::close(clients[i].fd);
+        clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i));
+        continue;
+      }
+      ++i;
+    }
+    std::vector<pollfd> pf;
+    pf.push_back(pollfd{ipc, POLLIN, 0});
+    short listen_ev = clients.size() < kMaxClients ? POLLIN : 0;
+    pf.push_back(pollfd{lfd, listen_ev, 0});
+    for (const auto& c : clients) pf.push_back(pollfd{c.fd, POLLIN, 0});
+    int pr = ::poll(pf.data(), static_cast<nfds_t>(pf.size()), 200);
     if (pr < 0) {
       if (errno == EINTR) continue;
       break;
@@ -588,36 +717,76 @@ int ServeChild(int ipc, const ServeConfig& cfg) {
       if (seq) {
         uint8_t buf[64];
         ssize_t n = ::recv(ipc, buf, sizeof(buf), 0);
-        if (n == 0) break;
-        if (n < 0) {
-          if (errno == EINTR) continue;
-          break;
+        if (n == 0) ipc_dead = true;
+        else if (n < 0) {
+          if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) ipc_dead = true;
+        } else if (n == 64 && Admit(buf, &latest)) {
+          have = true;
         }
-        if (n == 64 && Admit(buf, &latest)) have = true;
       } else {
         char buf[256];
         ssize_t n = ::recv(ipc, buf, sizeof(buf), 0);
-        if (n == 0) break;
-        if (n < 0) {
-          if (errno == EINTR) continue;
-          break;
-        }
-        acc.append(buf, static_cast<size_t>(n));
-        while (acc.size() >= sizeof(SnoopV1Frame)) {
-          if (Admit(reinterpret_cast<const uint8_t*>(acc.data()), &latest)) have = true;
-          acc.erase(0, sizeof(SnoopV1Frame));
+        if (n == 0) ipc_dead = true;
+        else if (n < 0) {
+          if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) ipc_dead = true;
+        } else {
+          acc.append(buf, static_cast<size_t>(n));
+          while (acc.size() >= sizeof(SnoopV1Frame)) {
+            if (Admit(reinterpret_cast<const uint8_t*>(acc.data()), &latest)) have = true;
+            acc.erase(0, sizeof(SnoopV1Frame));
+          }
         }
       }
-      if ((pf[0].revents & (POLLHUP | POLLERR | POLLNVAL)) && !(pf[0].revents & POLLIN)) break;
+      if ((pf[0].revents & (POLLHUP | POLLERR | POLLNVAL)) && !(pf[0].revents & POLLIN)) ipc_dead = true;
     }
-    if (pf[1].revents & POLLIN) {
+    if (!ipc_dead && (pf[1].revents & POLLIN) && clients.size() < kMaxClients) {
       int c = ::accept(lfd, nullptr, nullptr);
       if (c >= 0) {
-        HandleClient(c, cfg.api_key, have ? &latest : nullptr);
-        ::close(c);
+        int fl = ::fcntl(c, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(c, F_SETFL, fl | O_NONBLOCK);
+        timeval tv{};
+        tv.tv_sec = 2;
+        ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        Pending p;
+        p.fd = c;
+        p.deadline = MonoMs() + 2000;
+        clients.push_back(std::move(p));
       }
     }
+    for (size_t i = 0; i < clients.size();) {
+      short rev = 0;
+      for (size_t slot = 2; slot < pf.size(); ++slot) {
+        if (pf[slot].fd == clients[i].fd) {
+          rev = pf[slot].revents;
+          break;
+        }
+      }
+      if (!(rev & (POLLIN | POLLHUP | POLLERR))) {
+        ++i;
+        continue;
+      }
+      char buf[1024];
+      ssize_t n = ::recv(clients[i].fd, buf, sizeof(buf), 0);
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        ++i;
+        continue;
+      }
+      if (n > 0) clients[i].raw.append(buf, static_cast<size_t>(n));
+      bool done = n <= 0 || clients[i].raw.find("\r\n\r\n") != std::string::npos ||
+                  clients[i].raw.size() >= 8192;
+      if (!done) {
+        ++i;
+        continue;
+      }
+      if (!clients[i].raw.empty()) {
+        HandleClient(clients[i].fd, clients[i].raw, cfg.api_key, have ? &latest : nullptr);
+      }
+      ::close(clients[i].fd);
+      clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i));
+    }
   }
+  for (auto& c : clients) ::close(c.fd);
   ::close(lfd);
   ::close(ipc);
   return 0;

@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -141,42 +142,170 @@ std::string HeaderOf(const std::string& headers, const std::string& name) {
   return {};
 }
 
-bool HostLooksPrivate(const std::string& host) {
+bool Ipv4Blocked(uint32_t ip) {
+  unsigned a = (ip >> 24) & 0xff;
+  unsigned b = (ip >> 16) & 0xff;
+  if (a == 0 || a == 10 || a == 127) return true;
+  if (a == 100 && b >= 64 && b <= 127) return true;  // CGNAT 100.64/10
+  if (a == 169 && b == 254) return true;
+  if (a == 172 && b >= 16 && b <= 31) return true;
+  if (a == 192 && b == 168) return true;
+  if (a == 192 && b == 0) return true;
+  if (a == 198 && (b == 18 || b == 19)) return true;
+  if (a >= 224) return true;  // multicast and reserved
+  return false;
+}
+
+bool SockaddrBlocked(const sockaddr* sa) {
+  if (!sa) return true;
+  if (sa->sa_family == AF_INET) {
+    uint32_t ip = ntohl(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
+    return Ipv4Blocked(ip);
+  }
+  if (sa->sa_family == AF_INET6) {
+    const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+    const in6_addr& a = in6->sin6_addr;
+    if (IN6_IS_ADDR_V4MAPPED(&a)) {
+      uint32_t v4 = 0;
+      std::memcpy(&v4, a.s6_addr + 12, 4);
+      return Ipv4Blocked(ntohl(v4));
+    }
+    if (IN6_IS_ADDR_UNSPECIFIED(&a) || IN6_IS_ADDR_LOOPBACK(&a)) return true;
+    if (IN6_IS_ADDR_LINKLOCAL(&a) || IN6_IS_ADDR_MULTICAST(&a)) return true;
+#ifdef IN6_IS_ADDR_SITELOCAL
+    if (IN6_IS_ADDR_SITELOCAL(&a)) return true;
+#endif
+    unsigned char b0 = a.s6_addr[0];
+    if ((b0 & 0xfe) == 0xfc) return true;
+    bool v4compat = true;
+    for (int i = 0; i < 12; ++i) {
+      if (a.s6_addr[i] != 0) v4compat = false;
+    }
+    if (v4compat) {
+      uint32_t v4 = 0;
+      std::memcpy(&v4, a.s6_addr + 12, 4);
+      uint32_t host = ntohl(v4);
+      if (host > 1) return Ipv4Blocked(host);
+    }
+    return false;
+  }
+  return true;
+}
+
+bool NameBlocked(const std::string& host) {
   std::string h = host;
   for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  if (h == "localhost" || h == "localhost." || h == "::1" || h == "0.0.0.0") return true;
-  unsigned a = 0, b = 0, c = 0, d = 0;
-  char tail = 0;
-  if (std::sscanf(h.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4) {
-    if (a > 255 || b > 255 || c > 255 || d > 255) return true;
-    if (a == 127 || a == 10 || a == 0) return true;
-    if (a == 169 && b == 254) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    if (a == 192 && b == 168) return true;
-    return false;
+  return h == "localhost" || h == "localhost." || h == "localhost.localdomain";
+}
+
+// inet_aton accepts 127.1, 0x7f000001, 2130706433, and octal. inet_pton does not.
+bool ParseNumericAddress(const std::string& host, sockaddr_storage* ss, socklen_t* len) {
+  std::string h = host;
+  if (h.size() >= 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
+  std::memset(ss, 0, sizeof(*ss));
+  in6_addr a6{};
+  if (::inet_pton(AF_INET6, h.c_str(), &a6) == 1) {
+    auto* in = reinterpret_cast<sockaddr_in6*>(ss);
+    in->sin6_family = AF_INET6;
+    in->sin6_addr = a6;
+    *len = sizeof(sockaddr_in6);
+    return true;
+  }
+  in_addr a4{};
+  if (::inet_pton(AF_INET, h.c_str(), &a4) == 1 || ::inet_aton(h.c_str(), &a4) == 1) {
+    auto* in = reinterpret_cast<sockaddr_in*>(ss);
+    in->sin_family = AF_INET;
+    in->sin_addr = a4;
+    *len = sizeof(sockaddr_in);
+    return true;
   }
   return false;
 }
 
-bool SockaddrPrivate(const sockaddr* sa) {
-  if (!sa) return true;
+struct ResolvedAddr {
+  sockaddr_storage addr{};
+  socklen_t len = 0;
+  std::string ip;
+};
+
+std::string AddrText(const sockaddr* sa) {
+  char buf[INET6_ADDRSTRLEN];
+  if (!sa) return {};
   if (sa->sa_family == AF_INET) {
-    uint32_t ip = ntohl(reinterpret_cast<const sockaddr_in*>(sa)->sin_addr.s_addr);
-    unsigned a = (ip >> 24) & 0xff;
-    unsigned b = (ip >> 16) & 0xff;
-    if (a == 127 || a == 10 || a == 0) return true;
-    if (a == 169 && b == 254) return true;
-    if (a == 172 && b >= 16 && b <= 31) return true;
-    if (a == 192 && b == 168) return true;
-    return false;
+    if (!::inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(sa)->sin_addr, buf, sizeof(buf)))
+      return {};
+    return buf;
   }
   if (sa->sa_family == AF_INET6) {
-    const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
-    if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) || IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr)) return true;
-    unsigned char b0 = in6->sin6_addr.s6_addr[0];
-    if ((b0 & 0xfe) == 0xfc) return true;
+    if (!::inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6*>(sa)->sin6_addr, buf, sizeof(buf)))
+      return {};
+    return buf;
+  }
+  return {};
+}
+
+// Resolve once. Any blocked address rejects the whole set, so a public A record
+// cannot hide a loopback one. The caller pins these addresses and does not resolve again.
+bool ResolveHost(const std::string& host, int port, bool allow_private,
+                 std::vector<ResolvedAddr>* out, std::string* err) {
+  out->clear();
+  if (host.empty() || NameBlocked(host)) {
+    if (!allow_private) {
+      if (err) *err = "refusing private or loopback host (pass --from-url-allow-private)";
+      return false;
+    }
+  }
+  std::vector<ResolvedAddr> found;
+  sockaddr_storage numeric{};
+  socklen_t nlen = 0;
+  if (ParseNumericAddress(host, &numeric, &nlen)) {
+    if (numeric.ss_family == AF_INET) {
+      reinterpret_cast<sockaddr_in*>(&numeric)->sin_port = htons(static_cast<uint16_t>(port));
+    } else if (numeric.ss_family == AF_INET6) {
+      reinterpret_cast<sockaddr_in6*>(&numeric)->sin6_port = htons(static_cast<uint16_t>(port));
+    }
+    ResolvedAddr r;
+    r.addr = numeric;
+    r.len = nlen;
+    r.ip = AddrText(reinterpret_cast<sockaddr*>(&r.addr));
+    if (r.ip.empty()) {
+      if (err) *err = "unreadable numeric address";
+      return false;
+    }
+    found.push_back(std::move(r));
+  } else {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    std::string port_s = std::to_string(port);
+    if (::getaddrinfo(host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res) {
+      if (err) *err = "DNS lookup failed for " + host;
+      return false;
+    }
+    for (addrinfo* p = res; p; p = p->ai_next) {
+      if (!p->ai_addr || p->ai_addrlen <= 0) continue;
+      ResolvedAddr r;
+      std::memcpy(&r.addr, p->ai_addr, std::min(sizeof(r.addr), static_cast<size_t>(p->ai_addrlen)));
+      r.len = static_cast<socklen_t>(p->ai_addrlen);
+      r.ip = AddrText(reinterpret_cast<sockaddr*>(&r.addr));
+      if (!r.ip.empty()) found.push_back(std::move(r));
+    }
+    ::freeaddrinfo(res);
+    if (found.empty()) {
+      if (err) *err = "DNS lookup failed for " + host;
+      return false;
+    }
+  }
+  bool blocked = false;
+  for (const auto& r : found) {
+    if (SockaddrBlocked(reinterpret_cast<const sockaddr*>(&r.addr))) blocked = true;
+  }
+  if (blocked && !allow_private) {
+    if (err) *err = "refusing private, loopback, link-local, or non-global address";
     return false;
   }
+  *out = std::move(found);
   return true;
 }
 
@@ -194,36 +323,22 @@ bool HttpExchange(const std::string& url, HttpResp* out, std::string* err, bool 
     if (err) *err = "not an http URL";
     return false;
   }
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  addrinfo* res = nullptr;
-  std::string port = std::to_string(parts.port);
-  if (HostLooksPrivate(parts.host) && !allow_private) {
-    if (err) *err = "refusing private or loopback host (pass --from-url-allow-private)";
-    return false;
-  }
-  if (getaddrinfo(parts.host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
-    if (err) *err = "DNS lookup failed for " + parts.host;
-    return false;
-  }
+  std::vector<ResolvedAddr> addrs;
+  if (!ResolveHost(parts.host, parts.port, allow_private, &addrs, err)) return false;
   int fd = -1;
-  for (addrinfo* p = res; p; p = p->ai_next) {
-    if (SockaddrPrivate(p->ai_addr) && !allow_private) continue;
-    fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+  for (const auto& a : addrs) {
+    fd = ::socket(a.addr.ss_family, SOCK_STREAM, 0);
     if (fd < 0) continue;
     timeval tv{};
     tv.tv_sec = 20;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&a.addr), a.len) == 0) break;
     ::close(fd);
     fd = -1;
   }
-  freeaddrinfo(res);
   if (fd < 0) {
-    if (err) *err = allow_private ? "connect failed for " + url
-                                  : "refusing private address or connect failed for " + url;
+    if (err) *err = "connect failed for " + url;
     return false;
   }
   std::ostringstream req;
@@ -328,28 +443,52 @@ std::string HttpFetch(const std::string& url, std::string* err, const UrlFetchOp
   return {};
 }
 
-std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
-  UrlParts parts;
-  const std::string prefix = "https://";
-  if (url.rfind(prefix, 0) != 0) {
-    if (err) *err = "not an https URL";
-    return {};
-  }
+bool ParseSchemeUrl(const std::string& url, const char* scheme, int default_port, UrlParts* out) {
+  const std::string prefix = scheme;
+  if (url.rfind(prefix, 0) != 0) return false;
   std::string rest = url.substr(prefix.size());
   auto slash = rest.find('/');
   std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
-  std::string host = hostport;
-  auto colon = hostport.rfind(':');
-  if (!hostport.empty() && hostport.front() == '[') {
+  out->path = slash == std::string::npos ? "/" : rest.substr(slash);
+  if (hostport.empty()) return false;
+  if (hostport.front() == '[') {
     auto rb = hostport.find(']');
-    if (rb != std::string::npos) host = hostport.substr(1, rb - 1);
-  } else if (colon != std::string::npos && hostport.find(':') == colon) {
-    host = hostport.substr(0, colon);
+    if (rb == std::string::npos) return false;
+    out->host = hostport.substr(1, rb - 1);
+    if (rb + 1 < hostport.size() && hostport[rb + 1] == ':') {
+      out->port = std::atoi(hostport.c_str() + rb + 2);
+    } else {
+      out->port = default_port;
+    }
+  } else {
+    auto colon = hostport.rfind(':');
+    if (colon == std::string::npos) {
+      out->host = hostport;
+      out->port = default_port;
+    } else {
+      out->host = hostport.substr(0, colon);
+      out->port = std::atoi(hostport.c_str() + colon + 1);
+    }
   }
-  if ((HostLooksPrivate(host) || host.empty()) && !opt.allow_private) {
-    if (err) *err = "refusing private or loopback https host";
+  return !out->host.empty() && out->port > 0 && out->port <= 65535;
+}
+
+std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchOptions& opt) {
+  UrlParts parts;
+  if (!ParseSchemeUrl(url, "https://", 443, &parts)) {
+    if (err) *err = "not an https URL";
     return {};
   }
+  std::vector<ResolvedAddr> addrs;
+  if (!ResolveHost(parts.host, parts.port, opt.allow_private, &addrs, err)) return {};
+  std::string resolve_host = parts.host.find(':') != std::string::npos ? "[" + parts.host + "]" : parts.host;
+  std::string pinned;
+  for (size_t i = 0; i < addrs.size(); ++i) {
+    if (i) pinned += ",";
+    if (addrs[i].ip.find(':') != std::string::npos) pinned += "[" + addrs[i].ip + "]";
+    else pinned += addrs[i].ip;
+  }
+  std::string resolve_spec = resolve_host + ":" + std::to_string(parts.port) + ":" + pinned;
   int fds[2];
   if (PipeCloexec(fds) != 0) {
     if (err) *err = "pipe failed";
@@ -372,13 +511,17 @@ std::string HttpsFetch(const std::string& url, std::string* err, const UrlFetchO
       ::dup2(dn, STDERR_FILENO);
       if (dn > 2) ::close(dn);
     }
-    // argv only. Never a shell. curl is preferred; fetch is the FreeBSD client.
-    // -q ignores ~/.curlrc. --max-redirs 0 so a redirect cannot leave this host.
-    ::execlp("curl", "curl", "-q", "-fsSL", "--max-time", "20", "--proto", "=https",
-             "--max-redirs", "0", "-A", "llamaspy/0.2.0", "--", url.c_str(),
-             static_cast<char*>(nullptr));
-    ::execlp("fetch", "fetch", "-q", "-T", "20", "-o", "-", url.c_str(),
-             static_cast<char*>(nullptr));
+    // argv only. Never a shell. --resolve pins the addresses we already checked
+    // so curl cannot resolve the name again. -q ignores ~/.curlrc.
+    std::vector<std::string> args = {
+        "curl", "-q", "-fsSL", "--max-time", "20", "--proto", "=https",
+        "--max-redirs", "0", "-A", "llamaspy/0.2.0", "--resolve", resolve_spec,
+        "--", url};
+    std::vector<char*> av;
+    av.reserve(args.size() + 1);
+    for (auto& s : args) av.push_back(s.data());
+    av.push_back(nullptr);
+    ::execvp(av[0], av.data());
     _exit(127);
   }
   ::close(fds[1]);
@@ -597,6 +740,12 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
     }
     off += static_cast<size_t>(n);
   }
+  if (::fsync(tfd) != 0) {
+    ::close(tfd);
+    ::unlink(tmp.c_str());
+    r.error = "fsync failed";
+    return r;
+  }
   ::fchmod(tfd, 0600);
   ::close(tfd);
   if (!write_ok) {
@@ -617,6 +766,11 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
     r.error = "rename failed: " + path;
     ::unlink(tmp.c_str());
     return r;
+  }
+  int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {
+    ::fsync(dfd);
+    ::close(dfd);
   }
   r.ok = true;
   r.path = path;

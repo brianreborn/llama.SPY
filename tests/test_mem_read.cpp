@@ -179,6 +179,13 @@ int main() {
     CHECK(rdt.raw_bits == kChildTail);
   }
 
+  if (!build.empty()) {
+    auto bare = Binding("llamaspy_test_u64", 0, llamaspy::GgValueType::U64, "");
+    auto bare_rd = llamaspy::ReadBinding(static_cast<uint32_t>(child), bare);
+    CHECK(bare_rd.status == llamaspy::MemStatus::FingerprintMismatch);
+    CHECK(!bare_rd.has_value);
+  }
+
   auto bad = Binding("llamaspy_test_u64", 0, llamaspy::GgValueType::U64, "buildid:00000000deadbeef");
   auto mismatch = llamaspy::ReadBinding(static_cast<uint32_t>(child), bad);
   CHECK(mismatch.status == llamaspy::MemStatus::FingerprintMismatch);

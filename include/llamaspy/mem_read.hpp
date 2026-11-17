@@ -76,6 +76,11 @@ struct ProcIdentity {
   uint64_t start_a = 0;
   uint64_t start_b = 0;
   int pidfd = -1;
+  // Executable identity. An exec in the same pid keeps the start time.
+  bool have_exe = false;
+  uint64_t exe_dev = 0;
+  uint64_t exe_ino = 0;
+  uint64_t exe_map = 0;
 };
 
 ProcIdentity CaptureProcIdentity(uint32_t pid);

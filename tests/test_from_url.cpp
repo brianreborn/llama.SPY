@@ -124,8 +124,40 @@ static void CheckFetch() {
   CHECK(!bad.ok);
   CHECK(Has(bad.error, "http"));
 
+  ::kill(child, SIGTERM);
   int st = 0;
   ::waitpid(child, &st, 0);
+}
+
+static void CheckSsrfForms() {
+  const char* urls[] = {
+      "https://127.1/README.md",
+      "https://0x7f000001/README.md",
+      "https://2130706433/README.md",
+      "https://[::ffff:127.0.0.1]/README.md",
+      "https://100.64.0.1/README.md",
+  };
+  llamaspy::UrlFetchOptions opt;
+  for (const char* u : urls) {
+    auto wr = llamaspy::WriteHookDraftFromUrl(u, "/tmp/llamaspy-ssrf-should-not.json", true, opt);
+    if (wr.ok) std::cerr << "SSRF allowed " << u << "\n";
+    CHECK(!wr.ok);
+    CHECK(Has(wr.error, "refusing") || Has(wr.error, "private") || Has(wr.error, "loopback") ||
+          Has(wr.error, "non-global"));
+    ::unlink("/tmp/llamaspy-ssrf-should-not.json");
+  }
+}
+
+static void CheckHookRejects() {
+  const char* dup =
+      R"json({"llamaspy_hook":1,"name":"a","name":"b","js_body":"registerTool()"})json";
+  auto d = llamaspy::LoadHookScriptText(dup, "dup");
+  CHECK(d.js_body.empty());
+  CHECK(!d.errors.empty());
+  const char* bad = R"({"llamaspy_hook":1,"name":"a","js_body":"\x41"})";
+  auto e = llamaspy::LoadHookScriptText(bad, "esc");
+  CHECK(e.js_body.empty());
+  CHECK(!e.errors.empty());
 }
 
 static void CheckNestedJsDoesNotRun() {
@@ -158,6 +190,8 @@ static void CheckNestedJsDoesNotRun() {
 int main() {
   CheckDraftText();
   CheckNestedJsDoesNotRun();
+  CheckHookRejects();
+  CheckSsrfForms();
   CheckFetch();
   if (g_fail) {
     std::cerr << g_fail << " failure(s)\n";
