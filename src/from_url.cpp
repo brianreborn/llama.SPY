@@ -26,6 +26,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#  include <sys/syscall.h>
+#  ifndef RENAME_NOREPLACE
+#    define RENAME_NOREPLACE 1
+#  endif
+#endif
+
 namespace llamaspy {
 namespace {
 
@@ -695,6 +702,68 @@ std::string DraftHookScriptFromText(std::string_view body, std::string_view sour
   return RenderDraft(h, source_url, note);
 }
 
+struct SigHold {
+  sigset_t old{};
+  bool on = false;
+  SigHold() {
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
+    if (::sigprocmask(SIG_BLOCK, &block, &old) == 0) on = true;
+  }
+  ~SigHold() {
+    if (on) ::sigprocmask(SIG_SETMASK, &old, nullptr);
+  }
+};
+
+// 0 on success. EEXIST when path is already there. The temp name is removed
+// except when renameat2 has already turned it into path.
+int PublishNoReplace(const std::string& tmp, const std::string& path, const std::string& json) {
+#if defined(__linux__) && defined(SYS_renameat2)
+  if (::syscall(SYS_renameat2, AT_FDCWD, tmp.c_str(), AT_FDCWD, path.c_str(), RENAME_NOREPLACE) == 0) {
+    return 0;
+  }
+  int e = errno;
+  if (e == EEXIST) return EEXIST;
+  if (e != EINVAL && e != ENOSYS && e != ENOTSUP && e != EOPNOTSUPP && e != EPERM && e != EXDEV) {
+    return e;
+  }
+#else
+  if (::link(tmp.c_str(), path.c_str()) == 0) {
+    ::unlink(tmp.c_str());
+    return 0;
+  }
+  int e = errno;
+  if (e == EEXIST) return EEXIST;
+  if (e != EPERM && e != ENOTSUP && e != EOPNOTSUPP && e != EMLINK && e != EXDEV) return e;
+#endif
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) return errno == 0 ? EIO : errno;
+  size_t off = 0;
+  while (off < json.size()) {
+    ssize_t n = ::write(fd, json.data() + off, json.size() - off);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      int we = errno;
+      ::close(fd);
+      ::unlink(path.c_str());
+      return we == 0 ? EIO : we;
+    }
+    off += static_cast<size_t>(n);
+  }
+  if (::fsync(fd) != 0) {
+    int fe = errno;
+    ::close(fd);
+    ::unlink(path.c_str());
+    return fe == 0 ? EIO : fe;
+  }
+  ::close(fd);
+  ::unlink(tmp.c_str());
+  return 0;
+}
+
 DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string& out_path,
                                        bool overwrite, UrlFetchOptions opt) {
   DraftWriteResult r;
@@ -724,6 +793,8 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
   std::string pattern = dir + "/llamaspy-draft-XXXXXX";
   std::vector<char> tmpl(pattern.begin(), pattern.end());
   tmpl.push_back('\0');
+  // Held until publish finishes so SIGINT cannot leave the temp name behind.
+  SigHold hold;
   int tfd = ::mkstemp(tmpl.data());
   if (tfd < 0) {
     r.error = "mkstemp failed in " + dir;
@@ -735,6 +806,7 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
   while (off < json.size()) {
     ssize_t n = ::write(tfd, json.data() + off, json.size() - off);
     if (n < 0) {
+      if (errno == EINTR) continue;
       write_ok = false;
       break;
     }
@@ -754,14 +826,13 @@ DraftWriteResult WriteHookDraftFromUrl(const std::string& url, const std::string
     return r;
   }
   if (!overwrite) {
-    if (::link(tmp.c_str(), path.c_str()) != 0) {
-      int e = errno;
+    int pe = PublishNoReplace(tmp, path, json);
+    if (pe != 0) {
       ::unlink(tmp.c_str());
-      if (e == EEXIST) r.error = "refusing to overwrite " + path + " (pass --draft-force)";
-      else r.error = std::string("could not publish draft: ") + std::strerror(e);
+      if (pe == EEXIST) r.error = "refusing to overwrite " + path + " (pass --draft-force)";
+      else r.error = std::string("could not publish draft: ") + std::strerror(pe);
       return r;
     }
-    ::unlink(tmp.c_str());
   } else if (::rename(tmp.c_str(), path.c_str()) != 0) {
     r.error = "rename failed: " + path;
     ::unlink(tmp.c_str());

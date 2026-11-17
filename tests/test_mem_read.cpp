@@ -9,6 +9,26 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+#  include <sys/sysctl.h>
+#endif
+
+static std::string SelfExe() {
+  char buf[4096];
+#if defined(__linux__)
+  ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n > 0) {
+    buf[n] = 0;
+    return buf;
+  }
+#elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+  size_t len = sizeof(buf);
+  if (::sysctl(mib, 4, buf, &len, nullptr, 0) == 0 && buf[0] != '\0') return buf;
+#endif
+  return {};
+}
+
 #if defined(__linux__)
 #  include <sys/prctl.h>
 #endif
@@ -115,7 +135,7 @@ int main() {
     return 1;
   }
 
-  std::string build = llamaspy::GnuBuildIdFromFile("/proc/self/exe");
+  std::string build = llamaspy::GnuBuildIdFromFile(SelfExe());
   std::cerr << "build-id=" << (build.empty() ? "(none)" : build) << "\n";
   std::string fp = build.empty() ? "" : "buildid:" + build;
 
@@ -164,6 +184,14 @@ int main() {
   } else {
     CHECK(via_ptr.raw_bits == kChildU64);
   }
+  bool still_stopped = false;
+  for (int i = 0; i < 50 && !still_stopped; ++i) {
+    int pst = 0;
+    pid_t pw = ::waitpid(child, &pst, WNOHANG | WUNTRACED);
+    if (pw == child && WIFSTOPPED(pst)) still_stopped = true;
+    else ::usleep(20000);
+  }
+  CHECK(still_stopped);
 #endif
 
   auto u32 = Binding("llamaspy_test_u32", 0, llamaspy::GgValueType::U32, fp);

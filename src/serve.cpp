@@ -780,6 +780,10 @@ int ServeChild(int ipc, const ServeConfig& cfg) {
         continue;
       }
       if (!clients[i].raw.empty()) {
+        // The accept path is non-blocking so one slow client cannot stall the
+        // loop. The reply is blocking again so SO_SNDTIMEO covers a short write.
+        int fl = ::fcntl(clients[i].fd, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(clients[i].fd, F_SETFL, fl & ~O_NONBLOCK);
         HandleClient(clients[i].fd, clients[i].raw, cfg.api_key, have ? &latest : nullptr);
       }
       ::close(clients[i].fd);
@@ -1053,7 +1057,7 @@ void PrepareChild(pid_t expected_ppid) {
   ::signal(SIGHUP, SIG_DFL);
   ::signal(SIGCHLD, SIG_DFL);
   ::signal(SIGPIPE, SIG_IGN);
-  ArmParentDeath(SIGTERM, expected_ppid);
+  if (!ArmParentDeath(SIGTERM, expected_ppid)) _exit(1);
 }
 
 int RunPrivsepServe(const ServeConfig& cfg, const std::function<int(int ipc_fd)>& collector) {

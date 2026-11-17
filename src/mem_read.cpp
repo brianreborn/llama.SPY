@@ -596,11 +596,19 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
     return false;
   }
 
-  int pending_sig = 0;
   bool saw_attach_stop = false;
-  for (int spins = 0; spins < 64 && !saw_attach_stop; ++spins) {
+  // Bounded WNOHANG so an already-stopped target that never reports cannot
+  // hang the read while INT/TERM are blocked. Each foreign stop is continued
+  // with that signal, so a later one is not dropped.
+  for (int spins = 0; spins < 100 && !saw_attach_stop; ++spins) {
     int st = 0;
-    pid_t w = ::waitpid(static_cast<pid_t>(pid), &st, 0);
+    pid_t w = ::waitpid(static_cast<pid_t>(pid), &st, WNOHANG);
+    if (w == 0) {
+      timespec ts{};
+      ts.tv_nsec = 20000000L;
+      ::nanosleep(&ts, nullptr);
+      continue;
+    }
     if (w < 0) {
       if (errno == EINTR) continue;
       if (err) *err = std::string("waitpid after PT_ATTACH: ") + ErrnoText();
@@ -619,17 +627,16 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
       saw_attach_stop = true;
       break;
     }
-    // Deliver this signal now so a second, different stop is not dropped.
     if (::ptrace(PT_CONTINUE, static_cast<pid_t>(pid), reinterpret_cast<caddr_t>(1), sig) != 0) {
       if (err) *err = std::string("ptrace PT_CONTINUE while waiting for SIGSTOP: ") + ErrnoText();
-      DetachPtrace(pid, pending_sig, nullptr);
+      DetachPtrace(pid, 0, nullptr);
       restore();
       return false;
     }
   }
   if (!saw_attach_stop) {
     if (err) *err = "target did not stop with SIGSTOP after PT_ATTACH";
-    DetachPtrace(pid, pending_sig, nullptr);
+    DetachPtrace(pid, 0, nullptr);
     restore();
     return false;
   }
@@ -643,11 +650,10 @@ bool ReadPtrace(uint32_t pid, uint64_t addr, void* buf, size_t n, std::string* e
                      static_cast<int>(sizeof(iod))) == 0;
   int io_err = errno;
   std::string detach_err;
-  bool detached = DetachPtrace(pid, pending_sig, &detach_err);
-  if (was_stopped) {
-    // PT_DETACH resumes. Put an already-stopped target back to sleep.
-    ::kill(static_cast<pid_t>(pid), SIGSTOP);
-  }
+  // Data SIGSTOP leaves an already-stopped target stopped. Detach with 0
+  // would resume it for a moment before a later kill(SIGSTOP).
+  int detach_sig = was_stopped ? SIGSTOP : 0;
+  bool detached = DetachPtrace(pid, detach_sig, &detach_err);
   if (!ok && err) {
     if (io_err == EPERM || io_err == EACCES) *err = PermissionAdvice(pid) + " (" + std::strerror(io_err) + ")";
     else if (io_err == EBUSY) {

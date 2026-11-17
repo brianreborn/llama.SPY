@@ -60,4 +60,14 @@ if ! kill -0 "$PID" 2>/dev/null; then
   exit 1
 fi
 fetch_metrics
+kill -TERM "$PID"
+rc=0
+wait "$PID" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "SIGTERM exit $rc" >&2
+  cat "$TMP/out" >&2
+  PID=""
+  exit 1
+fi
+PID=""
 echo "serve longevity ok"

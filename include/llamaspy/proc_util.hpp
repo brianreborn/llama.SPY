@@ -34,15 +34,24 @@ inline int PipeCloexec(int fds[2]) {
 // Ask the kernel to signal us when our parent exits, then re-check.
 // expected_ppid is the parent's pid captured before fork. If that process
 // is already gone, _exit so we do not keep a listen socket or a tracer.
-inline void ArmParentDeath(int sig, pid_t expected_ppid) {
+// Returns false when the kernel call fails. The message is on stderr.
+inline bool ArmParentDeath(int sig, pid_t expected_ppid) {
+  int rc = 0;
 #if defined(__linux__)
-  ::prctl(PR_SET_PDEATHSIG, sig);
+  rc = ::prctl(PR_SET_PDEATHSIG, sig);
 #elif defined(__FreeBSD__) || defined(LLAMASPY_FREEBSD)
-  ::procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sig);
+  rc = ::procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sig);
 #else
   (void)sig;
+  rc = -1;
 #endif
+  if (rc != 0) {
+    const char msg[] = "llama.SPY: parent-death signal setup failed\n";
+    ssize_t wr = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)wr;
+  }
   if (expected_ppid > 0 && ::getppid() != expected_ppid) _exit(1);
+  return rc == 0;
 }
 
 // Polite signal, bounded wait, then SIGKILL. Also signals the child's

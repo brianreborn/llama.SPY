@@ -99,6 +99,11 @@ target_compile_definitions(test_mem_read PRIVATE LLAMASPY_SOURCE_DIR="${CMAKE_SO
 if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
   target_compile_definitions(test_mem_read PRIVATE LLAMASPY_FREEBSD=1)
 endif()
+# Synthesize a GNU build-id so the fingerprint checks do not depend on the
+# toolchain's default (clang and zig omit it).
+if(UNIX)
+  target_link_options(test_mem_read PRIVATE "LINKER:--build-id")
+endif()
 
 add_executable(test_serve tests/test_serve.cpp src/serve.cpp)
 target_include_directories(test_serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
