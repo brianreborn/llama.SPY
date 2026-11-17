@@ -230,6 +230,33 @@ int main() {
   CHECK(!llamaspy::ProcIdentityStill(ident));
   llamaspy::ReleaseProcIdentity(&ident);
 
+  // Exec keeps the pid and the start time. The executable inode must change.
+  pid_t execed = ::fork();
+  if (execed == 0) {
+    ::raise(SIGSTOP);
+    ::execl("/bin/sleep", "sleep", "30", static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  CHECK(execed > 0);
+  if (execed > 0) {
+    int est = 0;
+    ::waitpid(execed, &est, WUNTRACED);
+    auto before = llamaspy::CaptureProcIdentity(static_cast<uint32_t>(execed));
+    CHECK(before.have_exe);
+    CHECK(llamaspy::ProcIdentityStill(before));
+    ::kill(execed, SIGCONT);
+    bool changed = false;
+    for (int i = 0; i < 50 && !changed; ++i) {
+      if (!llamaspy::ProcIdentityStill(before)) changed = true;
+      else ::usleep(20000);
+    }
+    CHECK(changed);
+    CHECK(::kill(execed, 0) == 0);
+    ::kill(execed, SIGKILL);
+    ::waitpid(execed, nullptr, 0);
+    llamaspy::ReleaseProcIdentity(&before);
+  }
+
   if (g_fail) {
     std::cerr << g_fail << " failure(s)\n";
     return 1;

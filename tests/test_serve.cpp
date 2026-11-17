@@ -3,6 +3,10 @@
 #include <iostream>
 #include <string>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 static int g_fail = 0;
 
 #define CHECK(cond)                                              \
@@ -72,6 +76,36 @@ int main() {
 
   auto no_key = llamaspy::ListenerPolicyError(loop, "   ");
   CHECK(Has(no_key, "API key"));
+  CHECK(Has(no_key, "--listen-api-key"));
+  CHECK(no_key.find("--api-key or --api-key-file") == std::string::npos);
+
+  char dir_tmpl[] = "/tmp/llamaspy-key-XXXXXX";
+  char* made = ::mkdtemp(dir_tmpl);
+  CHECK(made != nullptr);
+  if (made) {
+    std::string dir = made;
+    std::string link = dir + "/link";
+    std::string loose = dir + "/loose";
+    CHECK(::symlink("/etc/hostname", link.c_str()) == 0);
+    std::string err;
+    CHECK(llamaspy::ReadApiKeyFile(link, &err).empty());
+    CHECK(Has(err, "symlink"));
+    int fd = ::open(loose.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+      CHECK(::write(fd, "secret\n", 7) == 7);
+      ::close(fd);
+    }
+    err.clear();
+    CHECK(llamaspy::ReadApiKeyFile(loose, &err).empty());
+    CHECK(Has(err, "group or other"));
+    CHECK(::chmod(loose.c_str(), 0600) == 0);
+    err.clear();
+    CHECK(llamaspy::ReadApiKeyFile(loose, &err) == "secret");
+    ::unlink(link.c_str());
+    ::unlink(loose.c_str());
+    ::rmdir(dir.c_str());
+  }
 
   if (g_fail) {
     std::cerr << g_fail << " failure(s)\n";

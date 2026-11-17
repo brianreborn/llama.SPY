@@ -83,17 +83,19 @@ static void CheckFetch() {
 
   pid_t child = ::fork();
   if (child == 0) {
-    int c = ::accept(fd, nullptr, nullptr);
-    if (c < 0) _exit(1);
-    char buf[1024];
-    (void)::recv(c, buf, sizeof(buf), 0);
     const char* body = "# Hello\n\nLLMS1|sym=llama_decode|off=0x0|width=8|type=u64|fp=buildid:abc\n";
-    std::string resp = "HTTP/1.0 200 OK\r\nContent-Length: ";
-    resp += std::to_string(std::strlen(body));
-    resp += "\r\nConnection: close\r\n\r\n";
-    resp += body;
-    (void)::send(c, resp.data(), resp.size(), 0);
-    ::close(c);
+    for (int nreq = 0; nreq < 2; ++nreq) {
+      int c = ::accept(fd, nullptr, nullptr);
+      if (c < 0) _exit(1);
+      char buf[1024];
+      (void)::recv(c, buf, sizeof(buf), 0);
+      std::string resp = "HTTP/1.0 200 OK\r\nContent-Length: ";
+      resp += std::to_string(std::strlen(body));
+      resp += "\r\nConnection: close\r\n\r\n";
+      resp += body;
+      (void)::send(c, resp.data(), resp.size(), 0);
+      ::close(c);
+    }
     _exit(0);
   }
   ::close(fd);
@@ -119,6 +121,9 @@ static void CheckFetch() {
     CHECK(Has(text, "llama_decode"));
     CHECK(!Has(text, "function("));
   }
+  auto again = llamaspy::WriteHookDraftFromUrl(url, out, false, opt);
+  CHECK(!again.ok);
+  CHECK(Has(again.error, "draft-force") || Has(again.error, "overwrite"));
   ::unlink(out.c_str());
 
   auto bad = llamaspy::WriteHookDraftFromUrl("file:///etc/passwd", "/tmp/should-not-write.json", true, opt);

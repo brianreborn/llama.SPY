@@ -25,7 +25,8 @@ ListenSpec ParseListenSpec(std::string_view text);
 // Non-loopback (0.0.0.0, *, ::, LAN, ...) is refused with or without a key.
 std::string ListenerPolicyError(const ListenSpec& spec, const std::string& api_key);
 
-// First line of path, trimmed. Warns on group/other readability.
+// First line of path, trimmed. Refuses a symlink, a non-regular file,
+// and any mode with group or other permission bits.
 // Empty string and *err set on failure.
 std::string ReadApiKeyFile(const std::string& path, std::string* err);
 

@@ -23,6 +23,7 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/bpftrace" << EOF
 #!/bin/sh
 echo \$\$ > "$TMP/tracer.pid"
+echo "\$@" > "$TMP/tracer.args"
 exec sleep 300
 EOF
 chmod 700 "$TMP/bin/bpftrace"
@@ -63,6 +64,12 @@ if kill -0 "$PID" 2>/dev/null; then
 fi
 if kill -0 "$TR" 2>/dev/null; then
   echo "tracer $TR survived SIGTERM of llamaspy" >&2
+  exit 1
+fi
+BT=$(awk '{print $NF}' "$TMP/tracer.args")
+DIR=$(dirname "$BT")
+if [ -e "$BT" ] || [ -d "$DIR" ]; then
+  echo "bpftrace program dir survived SIGTERM: $DIR" >&2
   exit 1
 fi
 PID=""
